@@ -1,0 +1,2921 @@
+From bf0d3bffefe9dd844a5bcae8d3dbdce27bfe0f26 Mon Sep 17 00:00:00 2001
+From: Katri Lantto <katrilantto@gmail.com>
+Date: Wed, 5 Mar 2025 15:50:42 +0100
+Subject: [PATCH] MPTCP Scheduling and Congestion Control Algorithms
+
+Changes made to run scheduling and congestion control algorithms on
+Linux Yocto. Not production level code. Also note that the code was developed on an out-of-tree kernel
+with changes made for a specific product, as such this version of the
+code might have some issues.
+
+Co-authored-by: Vera Svensson <vera.svensson@gmail.com>
+---
+ net/mptcp/Makefile          |  16 +-
+ net/mptcp/ctrl.c            |  53 ++++-
+ net/mptcp/mptcp_balia.c     | 274 ++++++++++++++++++++++++
+ net/mptcp/mptcp_blest.c     | 292 ++++++++++++++++++++++++++
+ net/mptcp/mptcp_ecf.c       | 188 +++++++++++++++++
+ net/mptcp/mptcp_lia.c       | 288 +++++++++++++++++++++++++
+ net/mptcp/mptcp_olia.c      | 325 +++++++++++++++++++++++++++++
+ net/mptcp/mptcp_redundant.c | 404 ++++++++++++++++++++++++++++++++++++
+ net/mptcp/mptcp_rr.c        | 135 ++++++++++++
+ net/mptcp/mptcp_wvegas.c    | 275 ++++++++++++++++++++++++
+ net/mptcp/protocol.c        | 103 +++++++--
+ net/mptcp/protocol.h        |  81 +++++++-
+ net/mptcp/sched.c           | 147 +++++++++++++
+ 13 files changed, 2555 insertions(+), 26 deletions(-)
+ create mode 100644 net/mptcp/mptcp_balia.c
+ create mode 100644 net/mptcp/mptcp_blest.c
+ create mode 100644 net/mptcp/mptcp_ecf.c
+ create mode 100644 net/mptcp/mptcp_lia.c
+ create mode 100644 net/mptcp/mptcp_olia.c
+ create mode 100644 net/mptcp/mptcp_redundant.c
+ create mode 100644 net/mptcp/mptcp_rr.c
+ create mode 100644 net/mptcp/mptcp_wvegas.c
+ create mode 100644 net/mptcp/sched.c
+
+diff --git a/net/mptcp/Makefile b/net/mptcp/Makefile
+index e54daceac58b..651cbfbad22e 100644
+--- a/net/mptcp/Makefile
++++ b/net/mptcp/Makefile
+@@ -2,11 +2,23 @@
+ obj-$(CONFIG_MPTCP) += mptcp.o
+ 
+ mptcp-y := protocol.o subflow.o options.o token.o crypto.o ctrl.o pm.o diag.o \
+-	   mib.o pm_netlink.o sockopt.o
++	   mib.o pm_netlink.o sockopt.o sched.o
+ 
+ obj-$(CONFIG_SYN_COOKIES) += syncookies.o
+ obj-$(CONFIG_INET_MPTCP_DIAG) += mptcp_diag.o
+ 
++# MPTCP Congeston Controls
++obj-m += mptcp_lia.o
++obj-m += mptcp_balia.o
++obj-m += mptcp_olia.o
++obj-m += mptcp_wvegas.o
++
++# MPTCP Schedulers
++obj-m += mptcp_rr.o
++obj-m += mptcp_redundant.o
++obj-m += mptcp_blest.o
++obj-m += mptcp_ecf.o
++
+ mptcp_crypto_test-objs := crypto_test.o
+ mptcp_token_test-objs := token_test.o
+-obj-$(CONFIG_MPTCP_KUNIT_TEST) += mptcp_crypto_test.o mptcp_token_test.o
++obj-$(CONFIG_MPTCP_KUNIT_TEST) += mptcp_crypto_test.o mptcp_token_test.o
+\ No newline at end of file
+diff --git a/net/mptcp/ctrl.c b/net/mptcp/ctrl.c
+index 8b235468c88f..dd7bf90b902c 100644
+--- a/net/mptcp/ctrl.c
++++ b/net/mptcp/ctrl.c
+@@ -26,6 +26,7 @@ struct mptcp_pernet {
+ 	u8 mptcp_enabled;
+ 	u8 checksum_enabled;
+ 	u8 allow_join_initial_addr_port;
++	char scheduler[MPTCP_SCHED_NAME_MAX];
+ };
+ 
+ static struct mptcp_pernet *mptcp_get_pernet(const struct net *net)
+@@ -58,6 +59,11 @@ unsigned int mptcp_stale_loss_cnt(const struct net *net)
+ 	return mptcp_get_pernet(net)->stale_loss_cnt;
+ }
+ 
++const char *mptcp_get_scheduler(const struct net *net)
++{
++	return mptcp_get_pernet(net)->scheduler;
++}
++
+ static void mptcp_pernet_set_defaults(struct mptcp_pernet *pernet)
+ {
+ 	pernet->mptcp_enabled = 1;
+@@ -65,9 +71,48 @@ static void mptcp_pernet_set_defaults(struct mptcp_pernet *pernet)
+ 	pernet->checksum_enabled = 0;
+ 	pernet->allow_join_initial_addr_port = 1;
+ 	pernet->stale_loss_cnt = 4;
++	strscpy(pernet->scheduler, "minrtt", sizeof(pernet->scheduler));
+ }
+ 
+ #ifdef CONFIG_SYSCTL
++
++static int mptcp_set_scheduler(const struct net *net, const char *name)
++{
++	struct mptcp_pernet *pernet = mptcp_get_pernet(net);
++	struct mptcp_sched_ops *sched;
++	int ret = 0;
++
++	rcu_read_lock();
++	sched = mptcp_sched_find(name);
++	if (sched)
++		strscpy(pernet->scheduler, name, MPTCP_SCHED_NAME_MAX);
++	else
++		ret = -ENOENT;
++	rcu_read_unlock();
++
++	return ret;
++}
++
++static int proc_mptcp_scheduler(struct ctl_table *ctl, int write,
++				void __user *buffer, size_t *lenp,
++				loff_t *ppos)
++{
++	const struct net *net = current->nsproxy->net_ns;
++	char val[MPTCP_SCHED_NAME_MAX];
++	struct ctl_table tbl = {
++		.data = val,
++		.maxlen = MPTCP_SCHED_NAME_MAX,
++	};
++	int ret;
++
++	strscpy(val, mptcp_get_scheduler(net), MPTCP_SCHED_NAME_MAX);
++
++	ret = proc_dostring(&tbl, write, buffer, lenp, ppos);
++	if (write && ret == 0)
++		ret = mptcp_set_scheduler(net, val);
++	return ret;
++}
++
+ static struct ctl_table mptcp_sysctl_table[] = {
+ 	{
+ 		.procname = "enabled",
+@@ -108,6 +153,12 @@ static struct ctl_table mptcp_sysctl_table[] = {
+ 		.mode = 0644,
+ 		.proc_handler = proc_douintvec_minmax,
+ 	},
++	{
++		.procname	= "scheduler",
++		.mode		= 0644,
++		.maxlen		= MPTCP_SCHED_NAME_MAX,
++		.proc_handler	= proc_mptcp_scheduler,
++	},
+ 	{}
+ };
+ 
+@@ -206,4 +257,4 @@ int __init mptcpv6_init(void)
+ 
+ 	return err;
+ }
+-#endif
++#endif
+\ No newline at end of file
+diff --git a/net/mptcp/mptcp_balia.c b/net/mptcp/mptcp_balia.c
+new file mode 100644
+index 000000000000..cb3956b0cfc0
+--- /dev/null
++++ b/net/mptcp/mptcp_balia.c
+@@ -0,0 +1,274 @@
++/*
++ *	MPTCP implementation - Balia Congestion Control
++ *	(Balanced Linked Adaptation Algorithm)
++ *
++ *	Original Analysis, Design and Implementation:
++ *	Qiuyu Peng <qpeng@caltech.edu>
++ *	Anwar Walid <anwar@research.bell-labs.com>
++ *	Jaehyun Hwang <jhyun.hwang@samsung.com>
++ *	Steven H. Low <slow@caltech.edu>
++ * 
++ *  Re-implemented for Linux kernel v5.15.60:
++ * 	Vera Svensson <versve@chalmers.se>
++ *  Katri Lantto <katri@chalmers.se>
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License
++ *	as published by the Free Software Foundation; either version
++ *	2 of the License, or (at your option) any later version.
++ */
++
++#include <linux/tcp.h>      // for tcp_sock etc.
++#include <net/sock.h>       // for sock
++#include <net/tcp.h>        // for tcp_sock util
++#include <net/mptcp.h>      // for mptcp_for_each_subflow util
++
++#include <linux/module.h>
++
++#include <net/inet_connection_sock.h> // for inet_csk_ca function
++#include "protocol.h"
++
++/* The variable 'rate' (i.e., x_r) will be scaled
++ * e.g., from B/s to KB/s, MB/s, or GB/s
++ * if max_rate > 2^rate_scale_limit
++ */
++
++static int rate_scale_limit = 25;
++static int alpha_scale = 10;
++static int scale_num = 5;
++
++struct mptcp_balia {
++	u64	ai;
++	u64	md;
++	bool	forced_update;
++};
++
++static inline int mptcp_balia_sk_can_send(struct mptcp_subflow_context *subflow)
++{
++	const struct sock *sub_sk = mptcp_subflow_tcp_sock(subflow);
++	return mptcp_sk_can_send(subflow) && tcp_sk(sub_sk)->srtt_us;
++}
++
++static inline u64 mptcp_get_ai(const struct sock *meta_sk)
++{
++	return ((struct mptcp_balia *)inet_csk_ca(meta_sk))->ai;
++}
++
++static inline void mptcp_set_ai(const struct sock *meta_sk, u64 ai)
++{
++	((struct mptcp_balia *)inet_csk_ca(meta_sk))->ai = ai;
++}
++
++static inline u64 mptcp_get_md(const struct sock *meta_sk)
++{
++	return ((struct mptcp_balia *)inet_csk_ca(meta_sk))->md;
++}
++
++static inline void mptcp_set_md(const struct sock *meta_sk, u64 md)
++{
++	((struct mptcp_balia *)inet_csk_ca(meta_sk))->md = md;
++}
++
++static inline u64 mptcp_balia_scale(u64 val, int scale)
++{
++	return (u64) val << scale;
++}
++
++static inline bool mptcp_get_forced(const struct sock *meta_sk)
++{
++	return ((struct mptcp_balia *)inet_csk_ca(meta_sk))->forced_update;
++}
++
++static inline void mptcp_set_forced(const struct sock *meta_sk, bool force)
++{
++	((struct mptcp_balia *)inet_csk_ca(meta_sk))->forced_update = force;
++}
++
++static void mptcp_balia_recalc_ai(const struct sock *sk)
++{
++	const struct tcp_sock *tp = tcp_sk(sk);
++	struct mptcp_subflow_context *tmp_subflow;
++	const struct mptcp_sock *msk = mptcp_sk(mptcp_subflow_ctx(sk)->conn); // old mpcb
++
++	u64 max_rate = 0, rate = 0, sum_rate = 0;
++	u64 alpha, ai = tp->snd_cwnd, md = (tp->snd_cwnd >> 1); 
++	int num_scale_down = 0;
++
++	if (!msk)
++		return;
++
++	/* Find max_rate first */
++	mptcp_for_each_subflow(msk, tmp_subflow) {
++		const struct sock *sub_sk = mptcp_subflow_tcp_sock(tmp_subflow);
++		struct tcp_sock *sub_tp = tcp_sk(sub_sk);
++		u64 tmp;
++
++		if (!mptcp_balia_sk_can_send(tmp_subflow))
++			continue;
++
++		tmp = div_u64((u64)tp->mss_cache * sub_tp->snd_cwnd
++				* (USEC_PER_SEC << 3), sub_tp->srtt_us);
++		sum_rate += tmp;
++
++		if (tp == sub_tp)
++			rate = tmp;
++
++		if (tmp >= max_rate)
++			max_rate = tmp;
++	}
++	// pr_info("BALIA max_rate %d\n", max_rate);
++
++	/* At least, the current subflow should be able to send */
++	if (unlikely(!rate))
++		goto exit;
++
++	alpha = div64_u64(max_rate, rate);
++
++	/* Scale down max_rate if it is too high (e.g., >2^25) */
++	while (max_rate > mptcp_balia_scale(1, rate_scale_limit)) {
++		max_rate >>= scale_num;
++		num_scale_down++;
++		// pr_info("BALIA scaled down max_rate for %d\n time", num_scale_down);
++	}
++
++	if (num_scale_down) {
++		sum_rate = 0;
++		mptcp_for_each_subflow(msk, tmp_subflow) {
++			const struct sock *sub_sk =   mptcp_subflow_tcp_sock(tmp_subflow);
++			struct tcp_sock *sub_tp = tcp_sk(sub_sk);
++			u64 tmp;
++
++			if (!mptcp_balia_sk_can_send(tmp_subflow))
++				continue;
++
++			tmp = div_u64((u64)tp->mss_cache * sub_tp->snd_cwnd
++				* (USEC_PER_SEC << 3), sub_tp->srtt_us);
++			tmp >>= (scale_num * num_scale_down);
++
++			sum_rate += tmp;
++		}
++		rate >>= (scale_num * num_scale_down);
++	}
++
++	/*	(sum_rate)^2 * 10 * w_r
++	 * ai = ------------------------------------
++	 *	(x_r + max_rate) * (4x_r + max_rate)
++	 */
++	sum_rate *= sum_rate;
++
++	ai = div64_u64(sum_rate * 10, rate + max_rate);
++	ai = div64_u64(ai * tp->snd_cwnd, (rate << 2) + max_rate);
++
++	if (unlikely(!ai))
++		ai = tp->snd_cwnd;
++
++	md = ((tp->snd_cwnd >> 1) * min(mptcp_balia_scale(alpha, alpha_scale),
++					mptcp_balia_scale(3, alpha_scale) >> 1))
++					>> alpha_scale;
++
++exit:
++	mptcp_set_ai(sk, ai);
++	mptcp_set_md(sk, md);
++}
++
++static void mptcp_balia_init(struct sock *sk)
++{
++	if (sk_is_mptcp(sk)) {
++		mptcp_set_forced(sk, 0);
++		mptcp_set_ai(sk, 0);
++		mptcp_set_md(sk, 0);
++	}
++}
++
++static void mptcp_balia_cwnd_event(struct sock *sk, enum tcp_ca_event event)
++{
++	if (event == CA_EVENT_COMPLETE_CWR || event == CA_EVENT_LOSS)
++		mptcp_balia_recalc_ai(sk);
++}
++
++static void mptcp_balia_set_state(struct sock *sk, u8 ca_state)
++{
++	if (!sk_is_mptcp(sk))
++		return;
++
++	mptcp_set_forced(sk, 1);
++}
++
++static void mptcp_balia_cong_avoid(struct sock *sk, u32 ack, u32 acked)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	int snd_cwnd;
++
++	if (!sk_is_mptcp(sk)) {
++		tcp_reno_cong_avoid(sk, ack, acked);
++		return;
++	}
++
++	if (!tcp_is_cwnd_limited(sk))
++		return;
++
++	if (tcp_in_slow_start(tp)) {
++		/* In "safe" area, increase. */
++		tcp_slow_start(tp, acked);
++		mptcp_balia_recalc_ai(sk);
++		return;
++	}
++
++	if (mptcp_get_forced(mptcp_meta_sk(sk))) {
++		mptcp_balia_recalc_ai(sk);
++		mptcp_set_forced(sk, 0);
++	}
++
++	snd_cwnd = (int)mptcp_get_ai(sk);
++
++	if (tp->snd_cwnd_cnt >= snd_cwnd) {
++		if (tp->snd_cwnd < tp->snd_cwnd_clamp) {
++			tp->snd_cwnd++;
++			mptcp_balia_recalc_ai(sk);
++		}
++
++		tp->snd_cwnd_cnt = 0;
++	} else {
++		tp->snd_cwnd_cnt++;
++	}
++}
++
++static u32 mptcp_balia_ssthresh(struct sock *sk)
++{
++	const struct tcp_sock *tp = tcp_sk(sk); // Maybe wrong, need to replace tp?
++
++	if (unlikely(!sk_is_mptcp(sk)))
++		return tcp_reno_ssthresh(sk);
++	else
++		return max((u32)(tp->snd_cwnd - mptcp_get_md(sk)), 1U);
++}
++
++static struct tcp_congestion_ops mptcp_balia = {
++	.init		= mptcp_balia_init,
++	.ssthresh	= mptcp_balia_ssthresh,
++	.cong_avoid	= mptcp_balia_cong_avoid,
++	.undo_cwnd	= tcp_reno_undo_cwnd,
++	.cwnd_event	= mptcp_balia_cwnd_event,
++	.set_state	= mptcp_balia_set_state,
++	.owner		= THIS_MODULE,
++	.name		= "balia",
++};
++
++static int __init mptcp_balia_register(void)
++{
++	BUILD_BUG_ON(sizeof(struct mptcp_balia) > ICSK_CA_PRIV_SIZE);
++	return tcp_register_congestion_control(&mptcp_balia);
++}
++
++static void __exit mptcp_balia_unregister(void)
++{
++	tcp_unregister_congestion_control(&mptcp_balia);
++}
++
++module_init(mptcp_balia_register);
++module_exit(mptcp_balia_unregister);
++
++MODULE_AUTHOR("Jaehyun Hwang, Anwar Walid, Qiuyu Peng, Steven H. Low");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("MPTCP BALIA CONGESTION CONTROL ALGORITHM");
++MODULE_VERSION("0.1");
+diff --git a/net/mptcp/mptcp_blest.c b/net/mptcp/mptcp_blest.c
+new file mode 100644
+index 000000000000..c72896d91e1d
+--- /dev/null
++++ b/net/mptcp/mptcp_blest.c
+@@ -0,0 +1,292 @@
++// SPDX-License-Identifier: GPL-2.0
++/*	MPTCP Scheduler to reduce HoL-blocking and spurious retransmissions.
++ *
++ *	Algorithm Design:
++ *	Simone Ferlin <ferlin@simula.no>
++ *	Ozgu Alay <ozgu@simula.no>
++ *	Olivier Mehani <olivier.mehani@nicta.com.au>
++ *	Roksana Boreli <roksana.boreli@nicta.com.au>
++ *
++ *	Initial Implementation:
++ *	Simone Ferlin <ferlin@simula.no>
++ *
++ *	Additional Authors:
++ *	Daniel Weber <weberd@cs.uni-bonn.de>
++ * 	Vera Svensson <versve@chalmers.se>
++ *  Katri Lantto <katri@chalmers.se>
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License
++ *	as published by the Free Software Foundation; either version
++ *	2 of the License, or (at your option) any later version.
++ */
++
++#include <linux/module.h>
++#include <net/mptcp.h>
++
++#include "protocol.h"
++
++static unsigned char lambda __read_mostly = 12;
++module_param(lambda, byte, 0644);
++MODULE_PARM_DESC(lambda, "Divided by 10 for scaling factor of fast flow rate estimation");
++
++static unsigned char max_lambda __read_mostly = 13;
++module_param(max_lambda, byte, 0644);
++MODULE_PARM_DESC(max_lambda, "Divided by 10 for maximum scaling factor of fast flow rate estimation");
++
++static unsigned char min_lambda __read_mostly = 10;
++module_param(min_lambda, byte, 0644);
++MODULE_PARM_DESC(min_lambda, "Divided by 10 for minimum scaling factor of fast flow rate estimation");
++
++static unsigned char dyn_lambda_good = 10; /* 1% */
++module_param(dyn_lambda_good, byte, 0644);
++MODULE_PARM_DESC(dyn_lambda_good, "Decrease of lambda in positive case.");
++
++static unsigned char dyn_lambda_bad = 40; /* 4% */
++module_param(dyn_lambda_bad, byte, 0644);
++MODULE_PARM_DESC(dyn_lambda_bad, "Increase of lambda in negative case.");
++
++struct blestsched_subflow_info {
++	u32 last_rbuf_opti;
++	u32 min_srtt_us;
++	u32 max_srtt_us;
++};
++
++struct blestsched_cb {
++	s16 lambda_1000; /* values range from min_lambda * 100 to max_lambda * 100 */
++	u32 last_lambda_update;
++};
++
++static struct blestsched_subflow_info *blestsched_get_subflow_info(const struct mptcp_subflow_context *subflow)
++{
++	return (struct blestsched_subflow_info *)&subflow->mptcp_sched[0];
++}
++
++static struct blestsched_cb *blestsched_get_cb(const struct mptcp_sock *msk)
++{
++	return (struct blestsched_cb *)&msk->mptcp_sched[0];
++}
++
++static void blestsched_update_lambda(struct mptcp_sock *msk, struct mptcp_subflow_context *slow_subflow)
++{
++	struct blestsched_cb *blest_cb = blestsched_get_cb(msk);
++	struct blestsched_subflow_info *blest_sub_info = blestsched_get_subflow_info(slow_subflow);
++
++	if (tcp_jiffies32 - blest_cb->last_lambda_update < usecs_to_jiffies(blest_sub_info->min_srtt_us >> 3))
++		return;
++
++	/* if there have been retransmissions of packets of the slow flow
++	 * during the slow flows last RTT => increase lambda
++	 * otherwise decrease
++	 */
++	if (tcp_sk(mptcp_subflow_tcp_sock(slow_subflow))->retrans_stamp) { // VERASV unclear if this rewrite is correct
++		/* need to slow down on the slow flow */
++		blest_cb->lambda_1000 += dyn_lambda_bad;
++	} else {
++		/* use the slow flow more */
++		blest_cb->lambda_1000 -= dyn_lambda_good;
++	}
++
++	/* cap lambda_1000 to its value range */
++	blest_cb->lambda_1000 = min_t(s16, blest_cb->lambda_1000, max_lambda * 100);
++	blest_cb->lambda_1000 = max_t(s16, blest_cb->lambda_1000, min_lambda * 100);
++
++	blest_cb->last_lambda_update = tcp_jiffies32;
++}
++
++static u32 blestsched_estimate_linger_time(struct sock *slow_sk)
++{
++	struct tcp_sock *tp = tcp_sk(slow_sk);
++	struct blestsched_subflow_info *blest_sub_info = blestsched_get_subflow_info(mptcp_subflow_ctx(slow_sk));
++	u32 estimate, slope, inflight, cwnd;
++
++	inflight = tcp_packets_in_flight(tp) + 1; /* take into account the new one */
++	cwnd = tp->snd_cwnd;
++
++	if (inflight >= cwnd) {
++		estimate = blest_sub_info->max_srtt_us;
++	} else {
++		slope = blest_sub_info->max_srtt_us - blest_sub_info->min_srtt_us;
++		if (cwnd == 0)
++			cwnd = 1; /* sanity */
++		estimate = blest_sub_info->min_srtt_us + (slope * inflight) / cwnd;
++	}
++
++	return (tp->srtt_us > estimate) ? tp->srtt_us : estimate;
++}
++
++
++/* how many bytes will sk send during the rtt of another, slower flow? */
++static u32 blestsched_estimate_bytes(struct sock *fast_sk, u32 time_8)
++{
++	struct tcp_sock *tp = tcp_sk(fast_sk);
++	struct mptcp_subflow_context *fast_subflow = mptcp_subflow_ctx(fast_sk);
++	struct blestsched_subflow_info *blest_sub_info = blestsched_get_subflow_info(fast_subflow);
++	struct blestsched_cb *blest_cb = blestsched_get_cb(mptcp_subflow_mptcp_sock(fast_subflow));
++	u32 avg_rtt, num_rtts, ca_cwnd, packets;
++
++	avg_rtt = (blest_sub_info->min_srtt_us + blest_sub_info->max_srtt_us) / 2;
++	if (avg_rtt == 0)
++		num_rtts = 1; /* sanity */
++	else
++		num_rtts = (time_8 / avg_rtt) + 1; /* round up */
++
++	/* during num_rtts, how many bytes will be sent on the flow?
++	 * assumes for simplification that Reno is applied as congestion-control
++	 */
++	if (tp->snd_ssthresh == TCP_INFINITE_SSTHRESH) {
++		/* we are in initial slow start */
++		if (num_rtts > 16)
++			num_rtts = 16; /* cap for sanity */
++		packets = tp->snd_cwnd * ((1 << num_rtts) - 1); /* cwnd + 2*cwnd + 4*cwnd */
++	} else {
++		ca_cwnd = max(tp->snd_cwnd, tp->snd_ssthresh + 1); /* assume we jump to CA already */
++		packets = (ca_cwnd + (num_rtts - 1) / 2) * num_rtts;
++	}
++
++	return div_u64(((u64)packets) * tp->mss_cache * blest_cb->lambda_1000, 1000);
++}
++
++
++/* This is the BLEST scheduler. This function decides on which flow to send
++ * a given MSS. If all subflows are found to be busy or the currently best
++ * subflow is estimated to possibly cause HoL-blocking, NULL is returned.
++ */
++struct sock *blest_get_available_subflow(struct mptcp_sock *msk,
++			   struct mptcp_sched_data *data)
++{
++	struct sock *bestsk, *minsk = NULL;
++	struct tcp_sock *besttp;
++	struct blestsched_subflow_info *blest_sub_info;
++	u32 min_srtt = U32_MAX;
++	struct mptcp_subflow_context *tmp_subflow;
++
++	/* First, find the overall best subflow */
++	mptcp_for_each_subflow(msk, tmp_subflow) {
++		bestsk = mptcp_subflow_tcp_sock(tmp_subflow);
++		besttp = tcp_sk(bestsk);
++		blest_sub_info = blestsched_get_subflow_info(tmp_subflow);
++
++		/* Set of states for which we are allowed to send data */
++		if (!mptcp_sk_can_send(tmp_subflow))
++			continue;
++
++		blest_sub_info->min_srtt_us = min(blest_sub_info->min_srtt_us, besttp->srtt_us);
++		blest_sub_info->max_srtt_us = max(blest_sub_info->max_srtt_us, besttp->srtt_us);
++
++		/* record minimal rtt */
++		if (besttp->srtt_us < min_srtt) {
++			min_srtt = besttp->srtt_us;
++			minsk = bestsk;
++		}
++	}
++
++	/* Fastest subflow is available! */
++	if(minsk && mptcp_is_available(mptcp_subflow_ctx(minsk)))
++		return minsk;
++
++	/* find the best available subflow according to the minRTT scheduler */
++	bestsk = get_available_subflow(msk, data);
++
++	/* if we decided to use a slower flow, we have the option of not using it at all */
++	/** bestsk = (S) slow available flow
++	 * minsk = (F) fast unavailable flow
++	 */
++	if (bestsk && minsk && bestsk != minsk) {
++		u32 slow_linger_time, fast_bytes, slow_inflight_bytes, slow_bytes, avail_space;
++		u32 frag_remaining_bytes, mss, buffered_bytes = 0;
++		struct mptcp_data_frag *dfrag = READ_ONCE(msk->first_pending);
++
++		besttp = tcp_sk(bestsk);
++
++		blestsched_update_lambda(msk, mptcp_subflow_ctx(bestsk));
++
++		/* if we send this SKB now, it will be acked in besttp->srtt seconds
++		 * during this time: how many bytes will we send on the fast flow?
++		 */
++		slow_linger_time = blestsched_estimate_linger_time(bestsk);
++		fast_bytes = blestsched_estimate_bytes(minsk, slow_linger_time); // X * lambda
++
++		if (dfrag)
++			frag_remaining_bytes = dfrag->data_len - dfrag->already_sent;
++			mss = tcp_current_mss(bestsk);
++			buffered_bytes = frag_remaining_bytes > mss ? mss : frag_remaining_bytes;
++
++		/* is the required space available in the mptcp meta send window?
++		 * we assume that all bytes inflight on the slow path will be acked in besttp->srtt seconds
++		 * (just like the SKB if it was sent now) -> that means that those inflight bytes will
++		 * keep occupying space in the meta window until then
++		 */
++		slow_inflight_bytes = besttp->write_seq - besttp->snd_una;
++		slow_bytes = buffered_bytes + slow_inflight_bytes;  //MSS * inflight => bytes of this package plus those in flight already
++
++		/* Combined sender window estimation */ // VERASV unclear if this is correct replacement of meta_tp->snd_wnd
++		u32 total_wnd = 0;
++		mptcp_for_each_subflow(msk, tmp_subflow){
++			total_wnd += tcp_sk(mptcp_subflow_tcp_sock(tmp_subflow))->snd_wnd; // [MPTCP send window]
++		}
++
++		avail_space = (slow_bytes < total_wnd) ? (total_wnd - slow_bytes) : 0; // Y
++
++		// X * lambda > Y => wait for faster subflow
++		if (fast_bytes > avail_space) {
++			/* sending this SKB on the slow flow means
++			 * we wouldn't be able to send all the data we'd like to send on the fast flow
++			 * so don't do that
++			 */
++			return NULL;
++		}
++	}
++
++	return bestsk;
++}
++
++static void blestsched_init(struct mptcp_sock *msk)
++{
++	struct mptcp_subflow_context *tmp_subflow;
++	struct blestsched_subflow_info *blest_sub_info;
++	struct blestsched_cb *blest_cb = blestsched_get_cb(msk);
++
++	mptcp_for_each_subflow(msk, tmp_subflow){
++		blest_sub_info = blestsched_get_subflow_info(tmp_subflow);
++		blest_sub_info->last_rbuf_opti = tcp_jiffies32;
++		blest_sub_info->min_srtt_us = U32_MAX;
++		blest_sub_info->max_srtt_us = 0;
++	}
++
++	if (!blest_cb->lambda_1000) {
++		blest_cb->lambda_1000 = lambda * 100;
++		blest_cb->last_lambda_update = tcp_jiffies32;
++	}
++}
++
++static struct mptcp_sched_ops mptcp_sched_blest = {
++	.get_subflow = blest_get_available_subflow,
++	.init = blestsched_init,
++	.name = "blest",
++	.owner = THIS_MODULE,
++};
++
++static int __init blest_register(void)
++{
++	BUILD_BUG_ON(sizeof(struct blestsched_subflow_info) > MPTCP_SCHED_SIZE);
++	BUILD_BUG_ON(sizeof(struct blestsched_cb) > MPTCP_SCHED_DATA_SIZE);
++
++	if (mptcp_register_scheduler(&mptcp_sched_blest))
++		return -1;
++
++	return 0;
++}
++
++static void blest_unregister(void)
++{
++	mptcp_unregister_scheduler(&mptcp_sched_blest);
++}
++
++module_init(blest_register);
++module_exit(blest_unregister);
++
++MODULE_AUTHOR("Simone Ferlin, Daniel Weber");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("BLEST scheduler for MPTCP, based on default minimum RTT scheduler");
++MODULE_VERSION("0.95");
+diff --git a/net/mptcp/mptcp_ecf.c b/net/mptcp/mptcp_ecf.c
+new file mode 100644
+index 000000000000..6ca996383560
+--- /dev/null
++++ b/net/mptcp/mptcp_ecf.c
+@@ -0,0 +1,188 @@
++// SPDX-License-Identifier: GPL-2.0
++/*	MPTCP ECF Scheduler
++ *
++ *	Algorithm Design:
++ *	Yeon-sup Lim <ylim@cs.umass.edu>
++ *	Don Towsley <towsley@cs.umass.edu>
++ *	Erich M. Nahum <nahum@us.ibm.com>
++ *	Richard J. Gibbens <richard.gibbens@cl.cam.ac.uk>
++ *
++ *	Initial Implementation:
++ *	Yeon-sup Lim <ylim@cs.umass.edu>
++ *
++ *	Additional Authors:
++ *	Daniel Weber <weberd@cs.uni-bonn.de>
++ * 	Vera Svensson <versve@chalmers.se>
++ *  Katri Lantto <katri@chalmers.se>
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License
++ *	as published by the Free Software Foundation; either version
++ *	2 of the License, or (at your option) any later version.
++ */
++
++#include <linux/module.h>
++#include <net/mptcp.h>
++#include <net/tcp.h>
++
++#include "protocol.h"
++
++static unsigned int mptcp_ecf_r_beta __read_mostly = 4; /* beta = 1/r_beta = 0.25 */
++module_param(mptcp_ecf_r_beta, int, 0644);
++MODULE_PARM_DESC(mptcp_ecf_r_beta, "beta for ECF");
++
++struct ecfsched_subflow_info {
++	u32 last_rbuf_opti;
++};
++
++struct ecfsched_cb {
++	u32 switching_margin; /* this is "waiting" in algorithm description */
++};
++
++static struct ecfsched_subflow_info *ecfsched_get_subflow_info(struct mptcp_subflow_context *subflow)
++{
++	return (struct ecfsched_subflow_info *)&subflow->mptcp_sched[0];
++}
++
++static struct ecfsched_cb *ecfsched_get_sched_data_size(struct mptcp_sock *msk)
++{
++	return (struct ecfsched_cb *)&msk->mptcp_sched[0];
++}
++
++/* This is the ECF scheduler. This function decides on which flow to send
++ * a given MSS. If all subflows are found to be busy or the currently best
++ * subflow is estimated to be slower than waiting for minsk, NULL is returned.
++ */
++static struct sock *ecf_get_available_subflow(struct mptcp_sock *msk,
++			   struct mptcp_sched_data *data)
++{
++	struct sock *bestsk, *minsk = NULL;
++	struct tcp_sock *besttp;
++	struct mptcp_subflow_context *tmp_subflow;
++
++	struct ecfsched_cb *ecf_cb = ecfsched_get_sched_data_size(msk);
++	u32 min_srtt = U32_MAX;
++
++	/* First, find the overall best (fastest) subflow */
++	mptcp_for_each_subflow(msk, tmp_subflow) {
++		bestsk = mptcp_subflow_tcp_sock(tmp_subflow);
++		besttp = tcp_sk(bestsk);
++
++		/* Set of states for which we are allowed to send data */
++		if (!mptcp_sk_can_send(tmp_subflow))
++			continue;
++
++		/* record minimal rtt */
++		if (besttp->srtt_us < min_srtt) {
++			min_srtt = besttp->srtt_us;
++			minsk = bestsk;
++		}
++	}
++
++	/* Fastest subflow is available! */
++	if(minsk && mptcp_is_available(mptcp_subflow_ctx(minsk)))
++		return minsk;
++
++	/* find the current best subflow according to the minRTT scheduler */
++	bestsk = get_available_subflow(msk, data);
++
++	/**
++	 * minsk = (F) fast unavailable subflow
++	 * bestsk = (S) slow available subflow
++	 * If minsk is an available flow, then minsk == bestsk should be true => use fastest subflow
++	 * If not, then minsk is faster but unavailable,
++	 * 		and bestsk is available but slower => decide if using slower or wait for faster (NULL)
++	 */
++	/* if we decided to use a slower flow, we have the option of not using it at all */
++	if (bestsk && minsk && bestsk != minsk) {
++		unsigned int mss = tcp_current_mss(bestsk); /* assuming equal MSS */
++		u32 sndbuf = 0;
++		struct mptcp_data_frag *dfrag = READ_ONCE(msk->first_pending);
++
++		if(dfrag)
++			sndbuf = dfrag->data_len - dfrag->already_sent;
++
++		/* Stats fast subflow */
++		u32 cwnd_f = tcp_sk(minsk)->snd_cwnd;
++		u32 srtt_f = tcp_sk(minsk)->srtt_us >> 3;
++		u32 rttvar_f = tcp_sk(minsk)->rttvar_us >> 1;
++
++		/* Stats slow subflow*/
++		u32 cwnd_s = tcp_sk(bestsk)->snd_cwnd;
++		u32 srtt_s = tcp_sk(bestsk)->srtt_us >> 3;
++		u32 rttvar_s = tcp_sk(bestsk)->rttvar_us >> 1;
++
++		u32 delta = max(rttvar_f, rttvar_s);
++
++		u32 x_f;
++		u64 lhs, rhs; /* to avoid overflow, using u64 */
++
++		x_f = sndbuf > cwnd_f * mss ? sndbuf : cwnd_f * mss; /* x_f =  max(waiting data, data size possible send) */
++		lhs = srtt_f * (x_f + cwnd_f * mss); /* completion time fast subflow = lhs = time it takes to send at least 2 full queues on fast subflow */
++		rhs = cwnd_f * mss * (srtt_s + delta); /* completion time slow subflow = rhs = time it takes to send 1 full queue on slow subflow with maximum deviation */
++
++		/* completion time fast subflow < completion time slow subflow => consider waiting for fast subflow */
++		if (mptcp_ecf_r_beta * lhs < mptcp_ecf_r_beta * rhs + ecf_cb->switching_margin * rhs) {
++			u32 x_s = sndbuf > cwnd_s * mss ? sndbuf : cwnd_s * mss;
++			u64 lhs_s = srtt_s * x_s;
++			u64 rhs_s = cwnd_s * mss * (2 * srtt_f + delta);
++
++			if (lhs_s >= rhs_s) {
++				/* too slower than fastest */
++				ecf_cb->switching_margin = 1;
++				/* Wait for fast subflow */
++				return NULL;
++			}
++		} else {
++			/* use slower one */
++			ecf_cb->switching_margin = 0;
++		}
++	}
++
++	return bestsk;
++}
++
++static void ecfsched_init(struct mptcp_sock *msk)
++{
++	struct ecfsched_cb *ecf_cb = ecfsched_get_sched_data_size(msk);
++	struct mptcp_subflow_context *tmp_subflow;
++	struct ecfsched_subflow_info *ecf_sub_info;
++	
++	ecf_cb->switching_margin = 0;
++
++	mptcp_for_each_subflow(msk, tmp_subflow){
++		ecf_sub_info = ecfsched_get_subflow_info(tmp_subflow);
++		ecf_sub_info->last_rbuf_opti = tcp_jiffies32;
++	}
++}
++
++struct mptcp_sched_ops mptcp_sched_ecf = {
++	.get_subflow = ecf_get_available_subflow,
++	.init = ecfsched_init,
++	.name = "ecf",
++	.owner = THIS_MODULE,
++};
++
++static int __init ecf_register(void)
++{
++	BUILD_BUG_ON(sizeof(struct ecfsched_subflow_info) > MPTCP_SCHED_SIZE);
++	BUILD_BUG_ON(sizeof(struct ecfsched_cb) > MPTCP_SCHED_DATA_SIZE);
++
++	if (mptcp_register_scheduler(&mptcp_sched_ecf))
++		return -1;
++
++	return 0;
++}
++
++static void ecf_unregister(void)
++{
++	mptcp_unregister_scheduler(&mptcp_sched_ecf);
++}
++
++module_init(ecf_register);
++module_exit(ecf_unregister);
++
++MODULE_AUTHOR("Yeon-sup Lim, Daniel Weber");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("ECF (Earliest Completion First) scheduler for MPTCP, based on default minimum RTT scheduler");
++MODULE_VERSION("0.95");
+diff --git a/net/mptcp/mptcp_lia.c b/net/mptcp/mptcp_lia.c
+new file mode 100644
+index 000000000000..aac74075b086
+--- /dev/null
++++ b/net/mptcp/mptcp_lia.c
+@@ -0,0 +1,288 @@
++/*
++ *	MPTCP implementation - Linked Increase congestion control Algorithm (LIA)
++ *
++ *	Initial Design & Implementation:
++ *	Sébastien Barré <sebastien.barre@uclouvain.be>
++ *
++ *	Current Maintainer & Author:
++ *	Christoph Paasch <christoph.paasch@uclouvain.be>
++ *
++ *	Additional authors:
++ *	Jaakko Korkeaniemi <jaakko.korkeaniemi@aalto.fi>
++ *	Gregory Detal <gregory.detal@uclouvain.be>
++ *	Fabien Duchêne <fabien.duchene@uclouvain.be>
++ *	Andreas Seelinger <Andreas.Seelinger@rwth-aachen.de>
++ *	Lavkesh Lahngir <lavkesh51@gmail.com>
++ *	Andreas Ripke <ripke@neclab.eu>
++ *	Vlad Dogaru <vlad.dogaru@intel.com>
++ *	Octavian Purdila <octavian.purdila@intel.com>
++ *	John Ronan <jronan@tssg.org>
++ *	Catalin Nicutar <catalin.nicutar@gmail.com>
++ *	Brandon Heller <brandonh@stanford.edu>
++ * 	Vera Svensson <versve@chalmers.se>
++ *  Katri Lantto <katri@chalmers.se>
++ *
++ *
++ *	This program is free software; you can redistribute it and/or
++ *      modify it under the terms of the GNU General Public License
++ *      as published by the Free Software Foundation; either version
++ *      2 of the License, or (at your option) any later version.
++ */
++#include <net/tcp.h>
++#include <net/mptcp.h>
++
++#include <linux/module.h>
++
++#include "protocol.h"
++
++/* Scaling is done in the numerator with alpha_scale_num and in the denominator
++ * with alpha_scale_den.
++ *
++ * To downscale, we just need to use alpha_scale.
++ *
++ * We have: alpha_scale = alpha_scale_num / (alpha_scale_den ^ 2)
++ */
++static int alpha_scale_den = 10;
++static int alpha_scale_num = 32;
++static int alpha_scale = 12;
++
++struct mptcp_ccc {
++	u64	alpha;
++	bool	forced_update;
++};
++
++static inline int mptcp_ccc_subflow_can_send(struct mptcp_subflow_context *subflow)
++{
++    const struct sock *sub_sk = mptcp_subflow_tcp_sock(subflow);
++	return mptcp_sk_can_send(subflow) && tcp_sk(sub_sk)->srtt_us;
++}
++
++
++static inline u64 mptcp_get_alpha(const struct sock *meta_sk)
++{
++	return ((struct mptcp_ccc *)inet_csk_ca(meta_sk))->alpha;
++}
++
++static inline void mptcp_set_alpha(const struct sock *meta_sk, u64 alpha)
++{
++	((struct mptcp_ccc *)inet_csk_ca(meta_sk))->alpha = alpha;
++}
++
++static inline u64 mptcp_ccc_scale(u32 val, int scale)
++{
++	return (u64) val << scale;
++}
++
++static inline bool mptcp_get_forced(const struct sock *meta_sk)
++{
++	return ((struct mptcp_ccc *)inet_csk_ca(meta_sk))->forced_update;
++}
++
++static inline void mptcp_set_forced(const struct sock *meta_sk, bool force)
++{
++	((struct mptcp_ccc *)inet_csk_ca(meta_sk))->forced_update = force;
++}
++
++static void mptcp_ccc_recalc_alpha(const struct sock *sk)
++{
++	struct mptcp_subflow_context *subflow;
++    const struct mptcp_sock *msk = mptcp_sk(mptcp_subflow_ctx(sk)->conn); 
++	int best_cwnd = 0, best_rtt = 0, can_send = 0;
++	u64 max_numerator = 0, sum_denominator = 0, alpha = 1;
++
++	if (!msk)
++		return;
++
++	/* Do regular alpha-calculation for multiple subflows */
++
++	/* Find the max numerator of the alpha-calculation */
++	/**
++	 * max_numerator = max(tmp)
++	 */
++	mptcp_for_each_subflow(msk, subflow) {
++		const struct sock *sub_sk = mptcp_subflow_tcp_sock(subflow);
++		struct tcp_sock *sub_tp = tcp_sk(sub_sk);
++		u64 tmp;
++
++		if (!mptcp_ccc_subflow_can_send(subflow))
++			continue;
++
++		can_send++;
++
++		/* We need to look for the path, that provides the max-value.
++		 * Integer-overflow is not possible here, because
++		 * tmp will be in u64.
++		 */
++
++		/**
++		 * tmp = cwnd_r / rtt²_r
++		 */
++		tmp = div64_u64(mptcp_ccc_scale(sub_tp->snd_cwnd,
++				alpha_scale_num), (u64)sub_tp->srtt_us * sub_tp->srtt_us);
++
++		if (tmp >= max_numerator) {
++			max_numerator = tmp;
++			best_cwnd = sub_tp->snd_cwnd;
++			best_rtt = sub_tp->srtt_us;
++		}
++	}
++
++	/* No subflow is able to send - we don't care anymore */
++	if (unlikely(!can_send))
++		goto exit;
++
++	/* Calculate the denominator */
++	/**
++	 * sum_denominator = SUM( cwnd_k/rtt_k )
++	 */
++	mptcp_for_each_subflow(msk, subflow) {
++		const struct sock *sub_sk = mptcp_subflow_tcp_sock(subflow);
++		struct tcp_sock *sub_tp = tcp_sk(sub_sk);
++
++		if (!mptcp_ccc_subflow_can_send(subflow))
++			continue;
++
++		/**
++		 * sum_denominator += cwnd_k/rtt_k
++		 */
++		sum_denominator += div_u64(
++				mptcp_ccc_scale(sub_tp->snd_cwnd,
++						alpha_scale_den) * best_rtt,
++						sub_tp->srtt_us);
++	}
++
++	/**
++	 * sum_denominator²
++	 */
++	sum_denominator *= sum_denominator;
++	if (unlikely(!sum_denominator)) {
++		pr_err("%s: sum_denominator == 0\n", __func__);
++		mptcp_for_each_subflow(msk, subflow) {
++		const struct sock *sub_sk = mptcp_subflow_tcp_sock(subflow);
++		struct tcp_sock *sub_tp = tcp_sk(sub_sk);
++			pr_err("%s, state:%d\n, rtt:%u, cwnd: %u",
++			       __func__,
++			       sub_sk->sk_state, sub_tp->srtt_us,
++			       sub_tp->snd_cwnd);
++		}
++	}
++
++	/**
++	 * alpha = max(cwnd_r / rtt²_r) / (SUM( cwnd_k/rtt_k ))²
++	 */
++	alpha = div64_u64(mptcp_ccc_scale(best_cwnd, alpha_scale_num), sum_denominator);
++
++	if (unlikely(!alpha))
++		alpha = 1;
++
++exit:
++	mptcp_set_alpha(mptcp_meta_sk(sk), alpha);
++}
++
++static void mptcp_ccc_init(struct sock *sk)
++{
++	if (sk_is_mptcp(sk)) { 
++		mptcp_set_forced(mptcp_meta_sk(sk), 0);
++		mptcp_set_alpha(mptcp_meta_sk(sk), 1);
++	}
++	/* If we do not mptcp, behave like reno: return */
++}
++
++static void mptcp_ccc_cwnd_event(struct sock *sk, enum tcp_ca_event event)
++{
++	if (event == CA_EVENT_LOSS)
++		mptcp_ccc_recalc_alpha(sk);
++}
++
++static void mptcp_ccc_set_state(struct sock *sk, u8 ca_state)
++{
++	if (!sk_is_mptcp(sk))
++		return;
++
++	mptcp_set_forced(mptcp_meta_sk(sk), 1);
++}
++
++static void mptcp_ccc_cong_avoid(struct sock *sk, u32 ack, u32 acked)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	int snd_cwnd;
++	u64 alpha;
++
++	if (!sk_is_mptcp(sk)) {
++		tcp_reno_cong_avoid(sk, ack, acked);
++		return;
++	}
++ 
++	if (!tcp_is_cwnd_limited(sk)) //ok
++		return;
++
++	if (tcp_in_slow_start(tp)) { //ok
++		/* In "safe" area, increase. */ 
++		tcp_slow_start(tp, acked);
++		mptcp_ccc_recalc_alpha(sk);
++		return;
++	}
++
++	if (mptcp_get_forced(mptcp_meta_sk(sk))) { 
++		mptcp_ccc_recalc_alpha(sk);
++		mptcp_set_forced(mptcp_meta_sk(sk), 0);
++	}
++
++	alpha = mptcp_get_alpha(mptcp_meta_sk(sk));
++
++	/* This may happen, if at the initialization, the mpcb
++	 * was not yet attached to the sock, and thus
++	 * initializing alpha failed.
++	 */
++	if (unlikely(!alpha))
++		alpha = 1;
++
++	snd_cwnd = (int)div_u64((u64)mptcp_ccc_scale(1, alpha_scale), alpha);
++
++	/* snd_cwnd_cnt >= max (scale * tot_cwnd / alpha, cwnd)
++	 * Thus, we select here the max value.
++	 */
++	if (snd_cwnd < tp->snd_cwnd)
++		snd_cwnd = tp->snd_cwnd;
++
++	if (tp->snd_cwnd_cnt >= snd_cwnd) {
++		if (tp->snd_cwnd < tp->snd_cwnd_clamp) {
++			tp->snd_cwnd++;
++			mptcp_ccc_recalc_alpha(sk);
++		}
++
++		tp->snd_cwnd_cnt = 0;
++	} else {
++		tp->snd_cwnd_cnt++;
++	}
++}
++
++static struct tcp_congestion_ops mptcp_ccc = {
++	.init		= mptcp_ccc_init,
++	.ssthresh	= tcp_reno_ssthresh,
++	.cong_avoid	= mptcp_ccc_cong_avoid,
++	.undo_cwnd	= tcp_reno_undo_cwnd,
++	.cwnd_event	= mptcp_ccc_cwnd_event,
++	.set_state	= mptcp_ccc_set_state,
++	.owner		= THIS_MODULE,
++	.name		= "lia",
++};
++
++static int __init mptcp_ccc_register(void)
++{
++	BUILD_BUG_ON(sizeof(struct mptcp_ccc) > ICSK_CA_PRIV_SIZE);
++	return tcp_register_congestion_control(&mptcp_ccc);
++}
++
++static void __exit mptcp_ccc_unregister(void)
++{
++	tcp_unregister_congestion_control(&mptcp_ccc);
++}
++
++module_init(mptcp_ccc_register);
++module_exit(mptcp_ccc_unregister);
++
++MODULE_AUTHOR("Christoph Paasch, Sébastien Barré");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("MPTCP LINKED INCREASE CONGESTION CONTROL ALGORITHM");
++MODULE_VERSION("0.1");
+diff --git a/net/mptcp/mptcp_olia.c b/net/mptcp/mptcp_olia.c
+new file mode 100644
+index 000000000000..fc4794ad1c33
+--- /dev/null
++++ b/net/mptcp/mptcp_olia.c
+@@ -0,0 +1,325 @@
++/*
++ * MPTCP implementation - OPPORTUNISTIC LINKED INCREASES CONGESTION CONTROL:
++ *
++ * Algorithm design:
++ * Ramin Khalili <ramin.khalili@epfl.ch>
++ * Nicolas Gast <nicolas.gast@epfl.ch>
++ * Jean-Yves Le Boudec <jean-yves.leboudec@epfl.ch>
++ *
++ * Implementation:
++ * Ramin Khalili <ramin.khalili@epfl.ch>
++ *
++ * Ported to the official MPTCP-kernel:
++ * Christoph Paasch <christoph.paasch@uclouvain.be>
++ * 
++ *  Re-implemented for Linux kernel v5.15.60:
++ * 	Vera Svensson <versve@chalmers.se>
++ *  Katri Lantto <katri@chalmers.se>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version
++ * 2 of the License, or (at your option) any later version.
++ */
++
++#include <net/tcp.h>
++#include <net/mptcp.h>
++
++#include <linux/module.h>
++#include "protocol.h"
++
++static int scale = 10;
++
++struct mptcp_olia {
++	u32	mptcp_loss1;
++	u32	mptcp_loss2;
++	u32	mptcp_loss3;
++	int	epsilon_num;
++	u32	epsilon_den;
++	int	mptcp_snd_cwnd_cnt;
++};
++
++static inline int mptcp_olia_sk_can_send(const struct mptcp_subflow_context *subflow)
++{
++	const struct sock *sub_sk = mptcp_subflow_tcp_sock(subflow);
++	return mptcp_sk_can_send(subflow) && tcp_sk(sub_sk)->srtt_us;
++}
++
++static inline u64 mptcp_olia_scale(u64 val, int scale)
++{
++	return (u64) val << scale;
++}
++
++/* take care of artificially inflate (see RFC5681)
++ * of cwnd during fast-retransmit phase
++ */
++static u32 mptcp_get_crt_cwnd(const struct sock *sk)
++{
++	const struct inet_connection_sock *icsk = inet_csk(sk);
++
++	if (icsk->icsk_ca_state == TCP_CA_Recovery)
++		return tcp_sk(sk)->snd_ssthresh;
++	else
++		return tcp_sk(sk)->snd_cwnd;
++}
++
++/* return the dominator of the first term of  the increasing term */
++static u64 mptcp_get_rate(const struct mptcp_sock *msk , u32 path_rtt)
++{
++	struct mptcp_subflow_context *tmp_subflow;
++	u64 rate = 1; /* We have to avoid a zero-rate because it is used as a divisor */
++
++	mptcp_for_each_subflow(msk, tmp_subflow) {
++		const struct sock *sk = mptcp_subflow_tcp_sock(tmp_subflow);
++		struct tcp_sock *tp = tcp_sk(sk);
++		u64 scaled_num;
++		u32 tmp_cwnd;
++
++		if (!mptcp_olia_sk_can_send(tmp_subflow))
++			continue;
++
++		tmp_cwnd = mptcp_get_crt_cwnd(sk);
++		scaled_num = mptcp_olia_scale(tmp_cwnd, scale) * path_rtt;
++		rate += div_u64(scaled_num , tp->srtt_us);
++	}
++	rate *= rate;
++	return rate;
++}
++
++/* find the maximum cwnd, used to find set M */
++static u32 mptcp_get_max_cwnd(const struct mptcp_sock *msk)
++{
++	struct mptcp_subflow_context *tmp_subflow; 
++	u32 best_cwnd = 0;
++	u32 tmp_cwnd;
++	struct sock *sk;
++
++	mptcp_for_each_subflow(msk, tmp_subflow) {
++		sk = mptcp_subflow_tcp_sock(tmp_subflow);
++
++		if (!mptcp_olia_sk_can_send(tmp_subflow))
++			continue;
++
++		tmp_cwnd = mptcp_get_crt_cwnd(sk);
++		if (tmp_cwnd > best_cwnd)
++			best_cwnd = tmp_cwnd;
++	}
++	return best_cwnd;
++}
++
++static void mptcp_get_epsilon(const struct mptcp_sock *msk)
++{
++	struct mptcp_subflow_context *tmp_subflow; 
++	struct mptcp_olia *ca;
++	struct tcp_sock *tp;
++	struct sock *sk;
++	u64 tmp_int, tmp_rtt, best_int = 0, best_rtt = 1;
++	u32 max_cwnd, tmp_cwnd, established_cnt = 0;
++	u8 M = 0, B_not_M = 0;
++
++	/* TODO - integrate this in the following loop - we just want to iterate once */
++
++	max_cwnd = mptcp_get_max_cwnd(msk);
++
++	/* find the best path */
++	mptcp_for_each_subflow(msk, tmp_subflow) {
++		sk = mptcp_subflow_tcp_sock(tmp_subflow);
++		tp = tcp_sk(sk);
++		ca = inet_csk_ca(sk);
++
++		if (!mptcp_olia_sk_can_send(tmp_subflow))
++			continue;
++
++		established_cnt++;
++
++		tmp_rtt = (u64)tp->srtt_us * tp->srtt_us;
++		/* TODO - check here and rename variables */
++		tmp_int = max(ca->mptcp_loss3 - ca->mptcp_loss2,
++			      ca->mptcp_loss2 - ca->mptcp_loss1);
++
++		if ((u64)tmp_int * best_rtt >= (u64)best_int * tmp_rtt) {
++			best_rtt = tmp_rtt;
++			best_int = tmp_int;
++		}
++	}
++
++	/* TODO - integrate this here in mptcp_get_max_cwnd and in the previous loop */
++	/* find the size of M and B_not_M */
++	mptcp_for_each_subflow(msk, tmp_subflow) {
++		sk = mptcp_subflow_tcp_sock(tmp_subflow);
++		tp = tcp_sk(sk);
++		ca = inet_csk_ca(sk);
++
++		if (!mptcp_olia_sk_can_send(tmp_subflow))
++			continue;
++
++		tmp_cwnd = mptcp_get_crt_cwnd(sk);
++		if (tmp_cwnd == max_cwnd) {
++			M++;
++		} else {
++			tmp_rtt = (u64)tp->srtt_us * tp->srtt_us;
++			tmp_int = max(ca->mptcp_loss3 - ca->mptcp_loss2,
++				      ca->mptcp_loss2 - ca->mptcp_loss1);
++
++			if ((u64)tmp_int * best_rtt == (u64)best_int * tmp_rtt)
++				B_not_M++;
++		}
++	}
++
++	/* check if the path is in M or B_not_M and set the value of epsilon accordingly */
++	mptcp_for_each_subflow(msk, tmp_subflow) {
++		sk = mptcp_subflow_tcp_sock(tmp_subflow);
++		tp = tcp_sk(sk);
++		ca = inet_csk_ca(sk);
++
++		if (!mptcp_olia_sk_can_send(tmp_subflow))
++			continue;
++
++		if (B_not_M == 0) {
++			ca->epsilon_num = 0;
++			ca->epsilon_den = 1;
++		} else {
++			tmp_rtt = (u64)tp->srtt_us * tp->srtt_us;
++			tmp_int = max(ca->mptcp_loss3 - ca->mptcp_loss2,
++				      ca->mptcp_loss2 - ca->mptcp_loss1);
++			tmp_cwnd = mptcp_get_crt_cwnd(sk);
++
++			if (tmp_cwnd < max_cwnd &&
++			    (u64)tmp_int * best_rtt == (u64)best_int * tmp_rtt) {
++				ca->epsilon_num = 1;
++				ca->epsilon_den = established_cnt * B_not_M;
++			} else if (tmp_cwnd == max_cwnd) {
++				ca->epsilon_num = -1;
++				ca->epsilon_den = established_cnt * M;
++			} else {
++				ca->epsilon_num = 0;
++				ca->epsilon_den = 1;
++			}
++		}
++	}
++}
++
++/* setting the initial values */
++static void mptcp_olia_init(struct sock *sk)
++{
++	const struct tcp_sock *tp = tcp_sk(sk);
++	struct mptcp_olia *ca = inet_csk_ca(sk);
++
++	if (sk_is_mptcp(sk)) {
++		ca->mptcp_loss1 = tp->snd_una;
++		ca->mptcp_loss2 = tp->snd_una;
++		ca->mptcp_loss3 = tp->snd_una;
++		ca->mptcp_snd_cwnd_cnt = 0;
++		ca->epsilon_num = 0;
++		ca->epsilon_den = 1;
++	}
++}
++
++/* updating inter-loss distance and ssthresh */
++static void mptcp_olia_set_state(struct sock *sk, u8 new_state)
++{
++	if (!sk_is_mptcp(sk))
++		return;
++
++	if (new_state == TCP_CA_Loss ||
++	    new_state == TCP_CA_Recovery || new_state == TCP_CA_CWR) {
++		struct mptcp_olia *ca = inet_csk_ca(sk);
++
++		if (ca->mptcp_loss3 != ca->mptcp_loss2 &&
++		    !inet_csk(sk)->icsk_retransmits) {
++			ca->mptcp_loss1 = ca->mptcp_loss2;
++			ca->mptcp_loss2 = ca->mptcp_loss3;
++		}
++	}
++}
++
++/* main algorithm */
++static void mptcp_olia_cong_avoid(struct sock *sk, u32 ack, u32 acked)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	struct mptcp_olia *ca = inet_csk_ca(sk);
++	const struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
++	struct mptcp_sock *msk = mptcp_sk(mptcp_meta_sk(sk));
++
++	u64 inc_num, inc_den, rate, cwnd_scaled;
++
++	if (!sk_is_mptcp(sk)) {
++		tcp_reno_cong_avoid(sk, ack, acked);
++		return;
++	}
++
++	ca->mptcp_loss3 = tp->snd_una;
++
++	if (!tcp_is_cwnd_limited(sk))
++		return;
++
++	/* slow start if it is in the safe area */
++	if (tcp_in_slow_start(tp)) {
++		tcp_slow_start(tp, acked);
++		return;
++	}
++
++	mptcp_get_epsilon(msk);
++	rate = mptcp_get_rate(msk, tp->srtt_us);
++	cwnd_scaled = mptcp_olia_scale(tp->snd_cwnd, scale);
++	inc_den = ca->epsilon_den * tp->snd_cwnd * rate ? : 1;
++
++	/* calculate the increasing term, scaling is used to reduce the rounding effect */
++	if (ca->epsilon_num == -1) {
++		if (ca->epsilon_den * cwnd_scaled * cwnd_scaled < rate) {
++			inc_num = rate - ca->epsilon_den *
++				cwnd_scaled * cwnd_scaled;
++			ca->mptcp_snd_cwnd_cnt -= div64_u64(
++			    mptcp_olia_scale(inc_num , scale) , inc_den);
++		} else {
++			inc_num = ca->epsilon_den *
++			    cwnd_scaled * cwnd_scaled - rate;
++			ca->mptcp_snd_cwnd_cnt += div64_u64(
++			    mptcp_olia_scale(inc_num , scale) , inc_den);
++		}
++	} else {
++		inc_num = ca->epsilon_num * rate +
++		    ca->epsilon_den * cwnd_scaled * cwnd_scaled;
++		ca->mptcp_snd_cwnd_cnt += div64_u64(
++		    mptcp_olia_scale(inc_num , scale) , inc_den);
++	}
++
++	if (ca->mptcp_snd_cwnd_cnt >= (1 << scale) - 1) {
++		if (tp->snd_cwnd < tp->snd_cwnd_clamp)
++			tp->snd_cwnd++;
++		ca->mptcp_snd_cwnd_cnt = 0;
++	} else if (ca->mptcp_snd_cwnd_cnt <= 0 - (1 << scale) + 1) {
++		tp->snd_cwnd = max((int) 1 , (int) tp->snd_cwnd - 1);
++		ca->mptcp_snd_cwnd_cnt = 0;
++	}
++}
++
++static struct tcp_congestion_ops mptcp_olia = {
++	.init		= mptcp_olia_init,
++	.ssthresh	= tcp_reno_ssthresh,
++	.cong_avoid	= mptcp_olia_cong_avoid,
++	.undo_cwnd	= tcp_reno_undo_cwnd,
++	.set_state	= mptcp_olia_set_state,
++	.owner		= THIS_MODULE,
++	.name		= "olia",
++};
++
++static int __init mptcp_olia_register(void)
++{
++	BUILD_BUG_ON(sizeof(struct mptcp_olia) > ICSK_CA_PRIV_SIZE);
++	return tcp_register_congestion_control(&mptcp_olia);
++}
++
++static void __exit mptcp_olia_unregister(void)
++{
++	tcp_unregister_congestion_control(&mptcp_olia);
++}
++
++
++module_init(mptcp_olia_register);
++module_exit(mptcp_olia_unregister);
++
++MODULE_AUTHOR("Ramin Khalili, Nicolas Gast, Jean-Yves Le Boudec");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("MPTCP COUPLED CONGESTION CONTROL");
++MODULE_VERSION("0.1");
+diff --git a/net/mptcp/mptcp_redundant.c b/net/mptcp/mptcp_redundant.c
+new file mode 100644
+index 000000000000..eb91c31ec2ac
+--- /dev/null
++++ b/net/mptcp/mptcp_redundant.c
+@@ -0,0 +1,404 @@
++/*
++ *	MPTCP Scheduler to reduce latency and jitter.
++ *
++ *	This scheduler sends all packets redundantly on all available subflows.
++ *
++ *	Initial Design & Implementation:
++ *	Tobias Erbshaeusser <erbshauesser@dvs.tu-darmstadt.de>
++ *	Alexander Froemmgen <froemmge@dvs.tu-darmstadt.de>
++ *
++ *	Initial corrections & modifications:
++ *	Christian Pinedo <christian.pinedo@ehu.eus>
++ *	Igor Lopez <igor.lopez@ehu.eus>
++ *
++ *	This program is free software; you can redistribute it and/or
++ *      modify it under the terms of the GNU General Public License
++ *      as published by the Free Software Foundation; either version
++ *      2 of the License, or (at your option) any later version.
++ */
++
++#include <linux/module.h>
++#include <net/mptcp.h>
++
++#include "protocol.h"
++
++// /* Struct to store the data of a single subflow */
++// struct redsched_priv {
++// 	/* The skb or NULL */
++// 	struct sk_buff *skb;
++// 	/* Start/end sequence number of the skb. This number should be checked
++// 	 * to be valid before the skb field is used
++// 	 */
++// 	u32 skb_start_seq;
++// 	u32 skb_end_seq;
++// };
++
++/* Struct to store the data of the control block */
++struct redsched_cb {
++	/* The next subflow where a skb should be sent or NULL */
++	struct tcp_sock *next_subflow;
++};
++
++// /* Returns the socket data from a given subflow socket */
++// static struct redsched_priv *redsched_get_priv(struct mptcp_subflow_context *subflow)
++// {
++// 	return (struct redsched_priv *)&subflow->mptcp_sched[0];
++// }
++
++/* Returns the control block data from a given meta socket */
++static struct redsched_cb *redsched_get_cb(const struct mptcp_subflow_context *subflow)
++{
++	// return (struct redsched_cb *)&tp->mpcb->mptcp_sched[0];
++	const struct mptcp_sock *msk = mptcp_sk(subflow->conn); 
++	return (struct redsched_cb *)&msk->mptcp_sched[0];
++}
++
++static bool redsched_get_active_valid_sks(struct sock *meta_sk)
++{
++	// struct tcp_sock *meta_tp = tcp_sk(meta_sk);
++	// struct mptcp_cb *mpcb = meta_tp->mpcb;
++	// struct mptcp_tcp_sock *mptcp;
++	int active_valid_sks = 0;
++
++	// mptcp_for_each_sub(mpcb, mptcp) {
++	// 	struct sock *sk = mptcp_to_sock(mptcp);
++
++	// 	if (subflow_is_active((struct tcp_sock *)sk) &&
++	// 	    !mptcp_is_def_unavailable(sk))
++	// 		active_valid_sks++;
++	// }
++
++	return active_valid_sks;
++}
++
++// static bool redsched_use_subflow(struct sock *meta_sk,
++// 				 int active_valid_sks,
++// 				 struct tcp_sock *tp,
++// 				 struct sk_buff *skb)
++// {
++// 	if (!skb || !mptcp_is_available((struct sock *)tp, skb, false))
++// 		return false;
++
++// 	if (TCP_SKB_CB(skb)->path_mask != 0)
++// 		return subflow_is_active(tp);
++
++// 	if (TCP_SKB_CB(skb)->path_mask == 0) {
++// 		if (active_valid_sks == -1)
++// 			active_valid_sks = redsched_get_active_valid_sks(meta_sk);
++
++// 		if (subflow_is_backup(tp) && active_valid_sks > 0)
++// 			return false;
++// 		else
++// 			return true;
++// 	}
++
++// 	return false;
++// }
++
++// #define mptcp_entry_next_rcu(__subflow)			
++// 	list_first_entry(rcu_dereference_raw(			
++// 		&(__subflow)->node), struct mptcp_subflow_context, node)
++
++static void redsched_update_next_subflow(struct mptcp_subflow_context *subflow,
++					 struct redsched_cb *red_cb)
++{
++	struct list_head *head_node = &subflow->node;
++
++	struct mptcp_subflow_context *nxt_subflow = list_first_entry(rcu_dereference_raw(head_node), struct mptcp_subflow_context, node);//struct mptcp_tcp_sock *mptcp = mptcp_entry_next_rcu(tp->mptcp);
++
++	if (nxt_subflow)
++		red_cb->next_subflow = tcp_sk(mptcp_subflow_tcp_sock(nxt_subflow));
++	else
++		red_cb->next_subflow = NULL;
++}
++
++static struct sock *red_get_available_subflow(struct sock *meta_sk,
++					      struct sk_buff *skb,
++					      bool zero_wnd_test)
++{
++	const struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(meta_sk); //struct tcp_sock *meta_tp = tcp_sk(meta_sk); struct mptcp_cb *mpcb = meta_tp->mpcb;
++	struct redsched_cb *red_cb = redsched_get_cb(subflow);
++	struct tcp_sock *first_tp = red_cb->next_subflow, *tp;
++	const struct mptcp_sock *msk = mptcp_subflow_mptcp_sock(subflow); 
++	int found = 0;
++
++	// /* Answer data_fin on same subflow */
++	// if (meta_sk->sk_shutdown & RCV_SHUTDOWN &&
++	//     skb && mptcp_is_data_fin(skb)) {
++	// 	mptcp_for_each_sub(mpcb, mptcp) {
++	// 		struct sock *sk = mptcp_to_sock(mptcp);
++
++	// 		if (tcp_sk(sk)->mptcp->path_index ==
++	// 			mpcb->dfin_path_index &&
++	// 		    mptcp_is_available(sk, skb, zero_wnd_test))
++	// 			return sk;
++	// 	}
++	// }
++
++	struct list_head *head = &msk->conn_list;
++
++	if (!first_tp && !list_empty(head)) {
++		first_tp = tcp_sk(list_first_entry(rcu_dereference_raw(head->next),
++					    struct mptcp_subflow_context, node)->tcp_sock);
++	}
++	tp = first_tp;
++
++	/* still NULL (no subflow in conn_list?) */
++	if (!first_tp)
++		return NULL;
++
++	/* Search for a subflow to send it.
++	 *
++	 * We want to pick a subflow that is after 'first_tp' in the list of subflows.
++	 * Thus, the first mptcp_for_each_sub()-loop tries to walk the list up
++	 * to the subflow 'tp' and then checks whether any one of the remaining
++	 * ones is eligible to send.
++	 * The second mptcp_for_each-sub()-loop is then iterating from the
++	 * beginning of the list up to 'first_tp'.
++	 */
++	mptcp_for_each_subflow(msk, subflow) {
++		/* We go up to the subflow 'tp' and start from there */
++		if (tp == tcp_sk(mptcp_subflow_tcp_sock(subflow)))
++			found = 1;
++
++		if (!found)
++			continue;
++		tp = tcp_sk(mptcp_subflow_tcp_sock(subflow));
++
++		if (mptcp_is_available((struct sock *)tp, skb,
++				       zero_wnd_test)) {
++			redsched_update_next_subflow(subflow, red_cb);
++			return (struct sock *)tp;
++		}
++	}
++
++	mptcp_for_each_subflow(msk, subflow) {
++		tp = tcp_sk(mptcp_subflow_tcp_sock(subflow));
++
++		if (tp == first_tp)
++			break;
++
++		if (mptcp_is_available((struct sock *)tp, skb,
++				       zero_wnd_test)) {
++			redsched_update_next_subflow(subflow, red_cb);
++			return (struct sock *)tp;
++		}
++	}
++
++	/* No space */
++	return NULL;
++}
++
++// /* Corrects the stored skb pointers if they are invalid */
++// static void redsched_correct_skb_pointers(struct sock *meta_sk,
++// 					  struct redsched_priv *red_p)
++// {
++// 	struct tcp_sock *meta_tp = tcp_sk(meta_sk);
++
++// 	if (red_p->skb &&
++// 	    (before(red_p->skb_start_seq, meta_tp->snd_una) ||
++// 	     after(red_p->skb_end_seq, meta_tp->snd_nxt)))
++// 		red_p->skb = NULL;
++// }
++
++// /* Returns the next skb from the queue */
++// static struct sk_buff *redsched_next_skb_from_queue(struct sk_buff_head *queue,
++// 						    struct sk_buff *previous,
++// 						    struct sock *meta_sk)
++// {
++// 	struct sk_buff *skb;
++
++// 	if (!previous)
++// 		return tcp_rtx_queue_head(meta_sk) ? : skb_peek(queue);
++
++// 	/* sk_data->skb stores the last scheduled packet for this subflow.
++// 	 * If sk_data->skb was scheduled but not sent (e.g., due to nagle),
++// 	 * we have to schedule it again.
++// 	 *
++// 	 * For the redundant scheduler, there are two cases:
++// 	 * 1. sk_data->skb was not sent on another subflow:
++// 	 *    we have to schedule it again to ensure that we do not
++// 	 *    skip this packet.
++// 	 * 2. sk_data->skb was already sent on another subflow:
++// 	 *    with regard to the redundant semantic, we have to
++// 	 *    schedule it again. However, we keep it simple and ignore it,
++// 	 *    as it was already sent by another subflow.
++// 	 *    This might be changed in the future.
++// 	 *
++// 	 * For case 1, send_head is equal previous, as only a single
++// 	 * packet can be skipped.
++// 	 */
++// 	if (tcp_send_head(meta_sk) == previous)
++// 		return tcp_send_head(meta_sk);
++
++// 	skb = skb_rb_next(previous);
++// 	if (skb)
++// 		return skb;
++
++// 	return tcp_send_head(meta_sk);
++// }
++
++static struct sk_buff *mptcp_red_next_segment(struct sock *meta_sk,
++					      int *reinject,
++					      struct sock **subsk,
++					      unsigned int *limit)
++{
++	const struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(meta_sk); //struct tcp_sock *meta_tp = tcp_sk(meta_sk); struct mptcp_cb *mpcb = meta_tp->mpcb;
++	struct redsched_cb *red_cb = redsched_get_cb(subflow);
++	struct tcp_sock *first_tp = red_cb->next_subflow, *tp;
++	const struct mptcp_sock *msk = mptcp_subflow_mptcp_sock(subflow); 
++	int active_valid_sks = -1;
++	struct sk_buff *skb;
++	int found = 0;
++
++
++// 	/* As we set it, we have to reset it as well. */
++// 	*limit = 0;
++
++	if (list_empty(&msk->rtx_queue) &&
++	    skb_queue_empty(&meta_sk->sk_write_queue) &&
++	    tcp_rtx_queue_empty(meta_sk))
++		/* Nothing to send */
++		return NULL;
++
++	// /* First try reinjections */
++	// skb = skb_peek(&msk->rtx_queue);
++	// if (skb) {
++	// 	*subsk = get_available_subflow(meta_sk, skb, false);
++	// 	if (!*subsk)
++	// 		return NULL;
++	// 	*reinject = 1;
++	// 	return skb;
++	// }
++
++	/* Then try indistinctly redundant and normal skbs */
++
++	struct list_head *head = &msk->conn_list;
++
++	if (!first_tp && !list_empty(head)) {
++		first_tp = tcp_sk(list_first_entry(rcu_dereference_raw(head->next),
++					    struct mptcp_subflow_context, node)->tcp_sock);
++	}
++
++	/* still NULL (no subflow in conn_list?) */
++	if (!first_tp)
++		return NULL;
++
++	tp = first_tp;
++
++	*reinject = 0;
++	// active_valid_sks = redsched_get_active_valid_sks(meta_sk);
++
++// 	/* We want to pick a subflow that is after 'first_tp' in the list of subflows.
++// 	 * Thus, the first mptcp_for_each_sub()-loop tries to walk the list up
++// 	 * to the subflow 'tp' and then checks whether any one of the remaining
++// 	 * ones can send a segment.
++// 	 * The second mptcp_for_each-sub()-loop is then iterating from the
++// 	 * beginning of the list up to 'first_tp'.
++// 	 */
++// 	mptcp_for_each_sub(mpcb, mptcp) {
++// 		struct redsched_priv *red_p;
++
++// 		if (tp == mptcp->tp)
++// 			found = 1;
++
++// 		if (!found)
++// 			continue;
++
++// 		tp = mptcp->tp;
++
++// 		/* Correct the skb pointers of the current subflow */
++// 		red_p = redsched_get_priv(tp);
++// 		redsched_correct_skb_pointers(meta_sk, red_p);
++
++// 		skb = redsched_next_skb_from_queue(&meta_sk->sk_write_queue,
++// 						   red_p->skb, meta_sk);
++// 		if (skb && redsched_use_subflow(meta_sk, active_valid_sks, tp,
++// 						skb)) {
++// 			red_p->skb = skb;
++// 			red_p->skb_start_seq = TCP_SKB_CB(skb)->seq;
++// 			red_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
++// 			redsched_update_next_subflow(tp, red_cb);
++// 			*subsk = (struct sock *)tp;
++
++// 			if (TCP_SKB_CB(skb)->path_mask)
++// 				*reinject = -1;
++// 			return skb;
++// 		}
++// 	}
++
++// 	mptcp_for_each_sub(mpcb, mptcp) {
++// 		struct redsched_priv *red_p;
++
++// 		tp = mptcp->tp;
++
++// 		if (tp == first_tp)
++// 			break;
++
++// 		/* Correct the skb pointers of the current subflow */
++// 		red_p = redsched_get_priv(tp);
++// 		redsched_correct_skb_pointers(meta_sk, red_p);
++
++// 		skb = redsched_next_skb_from_queue(&meta_sk->sk_write_queue,
++// 						   red_p->skb, meta_sk);
++// 		if (skb && redsched_use_subflow(meta_sk, active_valid_sks, tp,
++// 						skb)) {
++// 			red_p->skb = skb;
++// 			red_p->skb_start_seq = TCP_SKB_CB(skb)->seq;
++// 			red_p->skb_end_seq = TCP_SKB_CB(skb)->end_seq;
++// 			redsched_update_next_subflow(tp, red_cb);
++// 			*subsk = (struct sock *)tp;
++
++// 			if (TCP_SKB_CB(skb)->path_mask)
++// 				*reinject = -1;
++// 			return skb;
++// 		}
++// 	}
++
++	/* Nothing to send */
++	return NULL;
++}
++
++static void redsched_release(struct sock *sk)
++{
++	// struct tcp_sock *tp = tcp_sk(sk);
++	// struct redsched_cb *red_cb = redsched_get_cb(tp);
++
++	// /* Check if the next subflow would be the released one. If yes correct
++	//  * the pointer
++	//  */
++	// if (red_cb->next_subflow == tp)
++	// 	redsched_update_next_subflow(tp, red_cb);
++}
++
++static struct mptcp_sched_ops mptcp_sched_red = {
++	.get_subflow = red_get_available_subflow,
++	.next_segment = mptcp_red_next_segment,
++	.release = redsched_release,
++	.name = "redundant",
++	.owner = THIS_MODULE,
++};
++
++static int __init red_register(void)
++{
++	// BUILD_BUG_ON(sizeof(struct redsched_priv) > MPTCP_SCHED_SIZE);
++	// BUILD_BUG_ON(sizeof(struct redsched_cb) > MPTCP_SCHED_DATA_SIZE);
++
++	if (mptcp_register_scheduler(&mptcp_sched_red))
++		return -1;
++
++	return 0;
++}
++
++static void red_unregister(void)
++{
++	mptcp_unregister_scheduler(&mptcp_sched_red);
++}
++
++module_init(red_register);
++module_exit(red_unregister);
++
++MODULE_AUTHOR("Tobias Erbshaeusser, Alexander Froemmgen");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("REDUNDANT MPTCP");
++MODULE_VERSION("0.90");
+diff --git a/net/mptcp/mptcp_rr.c b/net/mptcp/mptcp_rr.c
+new file mode 100644
+index 000000000000..6db4063dd9b6
+--- /dev/null
++++ b/net/mptcp/mptcp_rr.c
+@@ -0,0 +1,135 @@
++/*
++* MPTCP ROUND ROBIN SCHEDULER: 
++* Heavily inspired by other MPTCP RR implementations
++*
++*  Implemented for Linux kernel v5.15.60:
++*  Vera Svensson <versve@chalmers.se>
++*  Katri Lantto <katri@chalmers.se>
++*
++*/
++
++#include <linux/module.h>
++#include <net/mptcp.h>
++
++#include "protocol.h"
++
++/* Struct to store the data of the control block */
++struct rrsched_cb {
++	/* The recentn subflow where a message was sent or NULL */
++	struct mptcp_subflow_context *recent_subflow;
++};
++
++/* Returns the control block data from a given meta socket */
++static struct rrsched_cb *rrsched_get_cb(const struct mptcp_sock *msk)
++{
++	return (struct rrsched_cb *)&msk->mptcp_sched[0];
++}
++
++static void rrsched_update_recent_subflow(struct mptcp_subflow_context *subflow,
++					 struct rrsched_cb *rr_cb)
++{
++	rr_cb->recent_subflow = subflow;
++}
++
++/* We just look for any subflow that is available */
++static struct sock *rr_get_available_subflow(struct mptcp_sock *msk,
++			   struct mptcp_sched_data *data)
++{
++	struct mptcp_subflow_context *tmp_subflow;
++	struct rrsched_cb *rr_cb = rrsched_get_cb(msk);
++	struct mptcp_subflow_context *recent_subflow = rr_cb->recent_subflow;
++		int found = 0;
++
++    /** If there is no recent_subflow, try to get the last
++     * sent on subflow from the mptcp sock
++    */
++	if (!recent_subflow && msk->last_snd) {
++		recent_subflow = mptcp_subflow_ctx(msk->last_snd);
++	}
++
++	mptcp_for_each_subflow(msk, tmp_subflow){
++		/** If this subflow comes after the most recent sent on subflow,
++		 *	Schedule it if it is available.
++		 * 	If there was not recent sent on subflow, this will start on the first subflow
++		 */
++		if (found || !recent_subflow){
++			if(mptcp_is_available(tmp_subflow)){
++                rrsched_update_recent_subflow(tmp_subflow, rr_cb);
++                return mptcp_subflow_tcp_sock(tmp_subflow);
++            }
++
++		}
++		if(tmp_subflow == recent_subflow){
++			found = 1;
++		}
++	}
++
++	/** If there was no available subflow after the most recently sent on,
++	 *  continue checking from the front of the list (Loop the list)
++	 */
++	mptcp_for_each_subflow(msk, tmp_subflow){
++
++		if (mptcp_is_available(tmp_subflow)) {
++			rrsched_update_recent_subflow(tmp_subflow, rr_cb);
++            return mptcp_subflow_tcp_sock(tmp_subflow);
++		}
++
++		if(tmp_subflow == recent_subflow){
++            break;
++        }
++	}
++
++	/* No avaiable subflows found */
++	return NULL;
++
++}
++
++static void rrsched_init(struct mptcp_sock *msk)
++{
++	struct rrsched_cb *rr_cb = rrsched_get_cb(msk);
++
++	rr_cb->recent_subflow = NULL;
++}
++
++static void rrsched_release(struct mptcp_subflow_context *subflow)
++{
++	struct rrsched_cb *rr_cb = rrsched_get_cb(mptcp_subflow_mptcp_sock(subflow));
++
++	/* Check if the recent subflow is the released one. If yes clear the pointer
++	 */
++	if (rr_cb->recent_subflow == subflow)
++		rrsched_update_recent_subflow(NULL, rr_cb);
++
++}
++
++static struct mptcp_sched_ops mptcp_sched_rr = {
++	.init = rrsched_init,
++	.get_subflow = rr_get_available_subflow,
++	.release = rrsched_release,
++	.name = "roundrobin",
++	.owner = THIS_MODULE,
++};
++
++static int __init rr_register(void)
++{
++	BUILD_BUG_ON(sizeof(struct rrsched_cb) > MPTCP_SCHED_DATA_SIZE);
++
++
++	if (mptcp_register_scheduler(&mptcp_sched_rr))
++		return -1;
++
++	return 0;
++}
++
++static void rr_unregister(void)
++{
++	mptcp_unregister_scheduler(&mptcp_sched_rr);
++}
++
++module_init(rr_register);
++module_exit(rr_unregister);
++
++MODULE_AUTHOR("Christoph Paasch");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("ROUNDROBIN MPTCP");
++MODULE_VERSION("0.89");
+diff --git a/net/mptcp/mptcp_wvegas.c b/net/mptcp/mptcp_wvegas.c
+new file mode 100644
+index 000000000000..08581b995454
+--- /dev/null
++++ b/net/mptcp/mptcp_wvegas.c
+@@ -0,0 +1,275 @@
++/*
++ *	MPTCP implementation - WEIGHTED VEGAS
++ *
++ *	Algorithm design:
++ *	Yu Cao <cyAnalyst@126.com>
++ *	Mingwei Xu <xmw@csnet1.cs.tsinghua.edu.cn>
++ *	Xiaoming Fu <fu@cs.uni-goettinggen.de>
++ *
++ *	Implementation:
++ *	Yu Cao <cyAnalyst@126.com>
++ *	Enhuan Dong <deh13@mails.tsinghua.edu.cn>
++ *
++ *	Ported to the official MPTCP-kernel:
++ *	Christoph Paasch <christoph.paasch@uclouvain.be>
++ *
++ *  Re-implemented for Linux kernel v5.15.60:
++ * 	Vera Svensson <versve@chalmers.se>
++ *  Katri Lantto <katri@chalmers.se>
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License
++ *	as published by the Free Software Foundation; either version
++ *	2 of the License, or (at your option) any later version.
++ */
++
++#include <linux/skbuff.h>
++#include <net/tcp.h>
++#include <net/mptcp.h>
++#include <linux/module.h>
++#include <linux/tcp.h>
++#include "protocol.h"
++
++
++static int initial_alpha = 2;
++static int total_alpha = 10;
++static int gamma = 1;
++
++module_param(initial_alpha, int, 0644);
++MODULE_PARM_DESC(initial_alpha, "initial alpha for all subflows");
++module_param(total_alpha, int, 0644);
++MODULE_PARM_DESC(total_alpha, "total alpha for all subflows");
++module_param(gamma, int, 0644);
++MODULE_PARM_DESC(gamma, "limit on increase (scale by 2)");
++
++#define MPTCP_WVEGAS_SCALE 16
++
++/* wVegas variables */
++struct wvegas {
++	u32	beg_snd_nxt;	/* right edge during last RTT */
++	u8	doing_wvegas_now;/* if true, do wvegas for this RTT */
++
++	u16	cnt_rtt;		/* # of RTTs measured within last RTT */
++	u32 sampled_rtt; /* cumulative RTTs measured within last RTT (in usec) */
++	u32	base_rtt;	/* the min of all wVegas RTT measurements seen (in usec) */
++
++	u64 instant_rate; /* cwnd / srtt_us, unit: pkts/us * 2^16 */
++	u64 weight; /* the ratio of subflow's rate to the total rate, * 2^16 */
++	int alpha; /* alpha for each subflows */
++
++	u32 queue_delay; /* queue delay*/
++};
++
++static inline u64 mptcp_wvegas_scale(u32 val, int scale)
++{
++	return (u64) val << scale;
++}
++
++static void wvegas_enable(const struct sock *sk)
++{
++	const struct tcp_sock *tp = tcp_sk(sk);
++	struct wvegas *wvegas = inet_csk_ca(sk);
++
++	wvegas->doing_wvegas_now = 1;
++
++	wvegas->beg_snd_nxt = tp->snd_nxt;
++
++	wvegas->cnt_rtt = 0;
++	wvegas->sampled_rtt = 0;
++
++	wvegas->instant_rate = 0;
++	wvegas->alpha = initial_alpha;
++	wvegas->weight = mptcp_wvegas_scale(1, MPTCP_WVEGAS_SCALE);
++
++	wvegas->queue_delay = 0;
++}
++
++static inline void wvegas_disable(const struct sock *sk)
++{
++	struct wvegas *wvegas = inet_csk_ca(sk);
++
++	wvegas->doing_wvegas_now = 0;
++}
++
++static void mptcp_wvegas_init(struct sock *sk)
++{
++	struct wvegas *wvegas = inet_csk_ca(sk);
++
++	wvegas->base_rtt = 0x7fffffff;
++	wvegas_enable(sk);
++}
++
++static inline u64 mptcp_wvegas_rate(u32 cwnd, u32 rtt_us)
++{
++	return div_u64(mptcp_wvegas_scale(cwnd, MPTCP_WVEGAS_SCALE), rtt_us);
++}
++
++static void mptcp_wvegas_pkts_acked(struct sock *sk,
++				    const struct ack_sample *sample)
++{
++	struct wvegas *wvegas = inet_csk_ca(sk);
++	u32 vrtt;
++
++	if (sample->rtt_us < 0)
++		return;
++
++	vrtt = sample->rtt_us + 1;
++
++	if (vrtt < wvegas->base_rtt)
++		wvegas->base_rtt = vrtt;
++
++	wvegas->sampled_rtt += vrtt;
++	wvegas->cnt_rtt++;
++}
++
++static void mptcp_wvegas_state(struct sock *sk, u8 ca_state)
++{
++	if (ca_state == TCP_CA_Open)
++		wvegas_enable(sk);
++	else
++		wvegas_disable(sk);
++}
++
++static void mptcp_wvegas_cwnd_event(struct sock *sk, enum tcp_ca_event event)
++{
++	if (event == CA_EVENT_CWND_RESTART) {
++		mptcp_wvegas_init(sk);
++	} else if (event == CA_EVENT_LOSS) {
++		struct wvegas *wvegas = inet_csk_ca(sk);
++		wvegas->instant_rate = 0;
++	}
++}
++
++static inline u32 mptcp_wvegas_ssthresh(const struct tcp_sock *tp)
++{
++	return  min(tp->snd_ssthresh, tp->snd_cwnd);
++}
++
++static u64 mptcp_wvegas_weight(const struct sock *sk)
++{
++	u64 total_rate = 0;
++	struct mptcp_subflow_context *tmp_subflow;
++	const struct wvegas *wvegas = inet_csk_ca(sk);
++	struct mptcp_sock *msk = mptcp_sk(mptcp_meta_sk(sk));
++
++	if (!msk)
++		return wvegas->weight;
++
++	mptcp_for_each_subflow(msk, tmp_subflow) {
++		const struct sock *sub_sk = mptcp_subflow_tcp_sock(tmp_subflow);
++		struct wvegas *sub_wvegas = inet_csk_ca(sub_sk);
++
++		/* sampled_rtt is initialized by 0 */
++		if (mptcp_sk_can_send(tmp_subflow) && (sub_wvegas->sampled_rtt > 0))
++			total_rate += sub_wvegas->instant_rate;
++	}
++
++	if (total_rate && wvegas->instant_rate)
++		return div64_u64(mptcp_wvegas_scale(wvegas->instant_rate, MPTCP_WVEGAS_SCALE), total_rate);
++	else
++		return wvegas->weight;
++}
++
++static void mptcp_wvegas_cong_avoid(struct sock *sk, u32 ack, u32 acked)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	struct wvegas *wvegas = inet_csk_ca(sk);
++
++	if (!wvegas->doing_wvegas_now) {
++		tcp_reno_cong_avoid(sk, ack, acked);
++		return;
++	}
++
++	if (after(ack, wvegas->beg_snd_nxt)) {
++		wvegas->beg_snd_nxt  = tp->snd_nxt;
++
++		if (wvegas->cnt_rtt <= 2) {
++			tcp_reno_cong_avoid(sk, ack, acked);
++		} else {
++			u32 rtt, diff, q_delay;
++			u64 target_cwnd;
++
++			rtt = wvegas->sampled_rtt / wvegas->cnt_rtt;
++			target_cwnd = div_u64(((u64)tp->snd_cwnd * wvegas->base_rtt), rtt);
++
++			diff = div_u64((u64)tp->snd_cwnd * (rtt - wvegas->base_rtt), rtt);
++
++			if (diff > gamma && tcp_in_slow_start(tp)) {
++				tp->snd_cwnd = min(tp->snd_cwnd, (u32)target_cwnd+1);
++				tp->snd_ssthresh = mptcp_wvegas_ssthresh(tp);
++
++			} else if (tcp_in_slow_start(tp)) {
++				tcp_slow_start(tp, acked);
++			} else {
++				if (diff >= wvegas->alpha) {
++					wvegas->instant_rate = mptcp_wvegas_rate(tp->snd_cwnd, rtt);
++					wvegas->weight = mptcp_wvegas_weight(sk);
++					wvegas->alpha = max(2U, (u32)((wvegas->weight * total_alpha) >> MPTCP_WVEGAS_SCALE));
++				}
++				if (diff > wvegas->alpha) {
++					tp->snd_cwnd--;
++					tp->snd_ssthresh = mptcp_wvegas_ssthresh(tp);
++				} else if (diff < wvegas->alpha) {
++					tp->snd_cwnd++;
++				}
++
++				/* Try to drain link queue if needed*/
++				q_delay = rtt - wvegas->base_rtt;
++				if ((wvegas->queue_delay == 0) || (wvegas->queue_delay > q_delay))
++					wvegas->queue_delay = q_delay;
++
++				if (q_delay >= 2 * wvegas->queue_delay) {
++					u32 backoff_factor = div_u64(mptcp_wvegas_scale(wvegas->base_rtt, MPTCP_WVEGAS_SCALE), 2 * rtt);
++					tp->snd_cwnd = ((u64)tp->snd_cwnd * backoff_factor) >> MPTCP_WVEGAS_SCALE;
++					wvegas->queue_delay = 0;
++				}
++			}
++
++			if (tp->snd_cwnd < 2)
++				tp->snd_cwnd = 2;
++			else if (tp->snd_cwnd > tp->snd_cwnd_clamp)
++				tp->snd_cwnd = tp->snd_cwnd_clamp;
++
++			tp->snd_ssthresh = tcp_current_ssthresh(sk);
++		}
++
++		wvegas->cnt_rtt = 0;
++		wvegas->sampled_rtt = 0;
++	}
++	/* Use normal slow start */
++	else if (tcp_in_slow_start(tp))
++		tcp_slow_start(tp, acked);
++}
++
++static struct tcp_congestion_ops mptcp_wvegas __read_mostly = {
++	.init		= mptcp_wvegas_init,
++	.ssthresh	= tcp_reno_ssthresh,
++	.cong_avoid	= mptcp_wvegas_cong_avoid,
++	.undo_cwnd	= tcp_reno_undo_cwnd,
++	.pkts_acked	= mptcp_wvegas_pkts_acked,
++	.set_state	= mptcp_wvegas_state,
++	.cwnd_event	= mptcp_wvegas_cwnd_event,
++
++	.owner		= THIS_MODULE,
++	.name		= "wvegas",
++};
++
++static int __init mptcp_wvegas_register(void)
++{
++	BUILD_BUG_ON(sizeof(struct wvegas) > ICSK_CA_PRIV_SIZE);
++	tcp_register_congestion_control(&mptcp_wvegas);
++	return 0;
++}
++
++static void __exit mptcp_wvegas_unregister(void)
++{
++	tcp_unregister_congestion_control(&mptcp_wvegas);
++}
++
++module_init(mptcp_wvegas_register);
++module_exit(mptcp_wvegas_unregister);
++
++MODULE_AUTHOR("Yu Cao, Enhuan Dong");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("MPTCP wVegas");
++MODULE_VERSION("0.1");
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 7f96e0c42a09..299885db4ad0 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -68,12 +68,6 @@ struct socket *__mptcp_nmpc_socket(const struct mptcp_sock *msk)
+ 	return msk->subflow;
+ }
+ 
+-/* Returns end sequence number of the receiver's advertised window */
+-static u64 mptcp_wnd_end(const struct mptcp_sock *msk)
+-{
+-	return READ_ONCE(msk->wnd_end);
+-}
+-
+ static bool mptcp_is_tcpsk(struct sock *sk)
+ {
+ 	struct socket *sock = sk->sk_socket;
+@@ -1394,17 +1388,6 @@ static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
+ 	return ret;
+ }
+ 
+-#define MPTCP_SEND_BURST_SIZE		((1 << 16) - \
+-					 sizeof(struct tcphdr) - \
+-					 MAX_TCP_OPTION_SPACE - \
+-					 sizeof(struct ipv6hdr) - \
+-					 sizeof(struct frag_hdr))
+-
+-struct subflow_send_info {
+-	struct sock *ssk;
+-	u64 ratio;
+-};
+-
+ void mptcp_subflow_set_active(struct mptcp_subflow_context *subflow)
+ {
+ 	if (!subflow->stale)
+@@ -1426,6 +1409,26 @@ bool mptcp_subflow_active(struct mptcp_subflow_context *subflow)
+ 	}
+ 	return __mptcp_subflow_active(subflow);
+ }
++EXPORT_SYMBOL_GPL(mptcp_subflow_active);
++
++static void mptcp_sched_data_set_contexts(const struct mptcp_sock *msk,
++					  struct mptcp_sched_data *data)
++{
++	struct mptcp_subflow_context *subflow;
++	int i = 0;
++
++	mptcp_for_each_subflow(msk, subflow) {
++		if (i == MPTCP_SUBFLOWS_MAX) {
++			pr_warn_once("too many subflows");
++			break;
++		}
++		data->contexts[i++] = subflow;
++	}
++	data->subflows = i;
++
++	for (; i < MPTCP_SUBFLOWS_MAX; i++)
++		data->contexts[i] = NULL;
++}
+ 
+ /* implement the mptcp packet scheduler;
+  * returns the subflow that will transmit the next DSS
+@@ -1441,6 +1444,8 @@ static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk)
+ 	long tout = 0;
+ 	u64 ratio;
+ 	u32 pace;
++	u32 burst;
++	struct mptcp_sched_data data;
+ 
+ 	sock_owned_by_me(sk);
+ 
+@@ -1450,6 +1455,24 @@ static struct sock *mptcp_subflow_get_send(struct mptcp_sock *msk)
+ 		return sk_stream_memory_free(msk->first) ? msk->first : NULL;
+ 	}
+ 
++	// Scheduler module ====
++	data.reinject = false;
++	if(msk->sched_ops != NULL){
++		mptcp_sched_data_set_contexts(msk, &data);
++		ssk = msk->sched_ops->get_subflow(msk, &data);
++		if(ssk && ssk != msk->last_snd){
++			msk->last_snd = ssk;
++			burst = min_t(int, MPTCP_SEND_BURST_SIZE,
++						tcp_sk(msk->last_snd)->snd_wnd);
++			if(burst)
++				msk->snd_burst = burst;
++		}
++		mptcp_set_timeout(sk);
++		return ssk;
++	}
++	// Scheduler module end ====
++	// Bellow follows default scheduler, basically identical to the defsched module...
++
+ 	/* re-use last subflow, if the burst allow that */
+ 	if (msk->last_snd && msk->snd_burst > 0 &&
+ 	    sk_stream_memory_free(msk->last_snd) &&
+@@ -1553,7 +1576,7 @@ void __mptcp_push_pending(struct sock *sk, unsigned int flags)
+ 
+ 			prev_ssk = ssk;
+ 			__mptcp_flush_join_list(msk);
+-			ssk = mptcp_subflow_get_send(msk);
++			ssk = mptcp_subflow_get_send(msk); // VERASV here is the next subflow to send on fetched
+ 
+ 			/* First check. If the ssk has changed since
+ 			 * the last round, release prev_ssk
+@@ -2142,12 +2165,21 @@ static struct sock *mptcp_subflow_get_retrans(struct mptcp_sock *msk)
+ 	struct sock *backup = NULL, *pick = NULL;
+ 	struct mptcp_subflow_context *subflow;
+ 	int min_stale_count = INT_MAX;
++	struct mptcp_sched_data data;
+ 
+ 	sock_owned_by_me((const struct sock *)msk);
+ 
+ 	if (__mptcp_check_fallback(msk))
+ 		return NULL;
+ 
++	// Scheduler module ===========
++	data.reinject = true;
++	if(msk->sched_ops != NULL){
++		mptcp_sched_data_set_contexts(msk, &data);
++		return msk->sched_ops->get_subflow(msk, &data);
++	}
++	// Scheduler module end ====
++
+ 	mptcp_for_each_subflow(msk, subflow) {
+ 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
+ 
+@@ -2271,6 +2303,10 @@ static void __mptcp_close_ssk(struct sock *sk, struct sock *ssk,
+ 
+ 	sock_put(ssk);
+ 
++	if(msk->sched_ops->release){
++		msk->sched_ops->release(subflow);
++	}
++
+ 	if (ssk == msk->last_snd)
+ 		msk->last_snd = NULL;
+ 
+@@ -2469,8 +2505,28 @@ static void mptcp_worker(struct work_struct *work)
+ 	sock_put(sk);
+ }
+ 
++int mptcp_init_sched(struct mptcp_sock *msk,
++		     struct mptcp_sched_ops *sched)
++{
++	if (!sched)
++		sched = &mptcp_sched_rtt;
++
++	if (!try_module_get(sched->owner))
++		return -EBUSY;
++
++	msk->sched_ops = sched;
++	if (msk->sched_ops->init)
++		msk->sched_ops->init(msk);
++
++	pr_debug("sched=%s\n", msk->sched_ops->name);
++
++	return 0;
++}
++
+ static int __mptcp_init_sock(struct sock *sk)
+ {
++	int ret = 0;
++	struct net *net = sock_net(sk);
+ 	struct mptcp_sock *msk = mptcp_sk(sk);
+ 
+ 	spin_lock_init(&msk->join_list_lock);
+@@ -2498,7 +2554,11 @@ static int __mptcp_init_sock(struct sock *sk)
+ 	timer_setup(&msk->sk.icsk_retransmit_timer, mptcp_retransmit_timer, 0);
+ 	timer_setup(&sk->sk_timer, mptcp_timeout_timer, 0);
+ 
+-	return 0;
++
++	ret = mptcp_init_sched(mptcp_sk(sk),
++			       mptcp_sched_find(mptcp_get_scheduler(net)));
++
++	return ret;
+ }
+ 
+ static int mptcp_init_sock(struct sock *sk)
+@@ -2750,6 +2810,7 @@ static void mptcp_close(struct sock *sk, long timeout)
+ 		mptcp_event(MPTCP_EVENT_CLOSED, mptcp_sk(sk), NULL, GFP_KERNEL);
+ 
+ 	sock_put(sk);
++	mptcp_cleanup_scheduler(mptcp_sk(sk));
+ }
+ 
+ static void mptcp_copy_inaddrs(struct sock *msk, const struct sock *ssk)
+@@ -2833,6 +2894,7 @@ struct sock *mptcp_sk_clone(const struct sock *sk,
+ 	msk->snd_una = msk->write_seq;
+ 	msk->wnd_end = msk->snd_nxt + req->rsk_rcv_wnd;
+ 	msk->setsockopt_seq = mptcp_sk(sk)->setsockopt_seq;
++	mptcp_init_sched(msk, mptcp_sk(sk)->sched_ops);
+ 
+ 	if (mp_opt->suboptions & OPTIONS_MPTCP_MPC) {
+ 		msk->can_ack = true;
+@@ -3556,6 +3618,7 @@ void __init mptcp_proto_init(void)
+ 
+ 	mptcp_subflow_init();
+ 	mptcp_pm_init();
++	mptcp_register_scheduler(&mptcp_sched_rtt);
+ 	mptcp_token_init();
+ 
+ 	if (proto_register(&mptcp_prot, 1) != 0)
+@@ -3628,4 +3691,4 @@ int __init mptcp_proto_v6_init(void)
+ 
+ 	return err;
+ }
+-#endif
++#endif
+\ No newline at end of file
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index e193b710b471..5f367a1b3a68 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -124,6 +124,17 @@
+ #define MPTCP_WORK_SYNC_SETSOCKOPT 10
+ #define MPTCP_CONNECTED		11
+ 
++/* MPTCP scheduler variables*/
++#define MPTCP_SCHED_NAME_MAX 16
++#define MPTCP_SCHED_DATA_SIZE 8 //From mptcp_cb -> mptcp_sock
++#define MPTCP_SCHED_SIZE 16 //From mptcp_tcp_sock -> subflow_context
++#define MPTCP_SUBFLOWS_MAX	8
++#define MPTCP_SEND_BURST_SIZE		((1 << 16) - \
++					 sizeof(struct tcphdr) - \
++					 MAX_TCP_OPTION_SPACE - \
++					 sizeof(struct ipv6hdr) - \
++					 sizeof(struct frag_hdr))
++
+ static inline bool before64(__u64 seq1, __u64 seq2)
+ {
+ 	return (__s64)(seq1 - seq2) < 0;
+@@ -228,7 +239,7 @@ struct mptcp_sock {
+ 	u64		rcv_wnd_sent;
+ 	u64		rcv_data_fin_seq;
+ 	int		wmem_reserved;
+-	struct sock	*last_snd;
++	struct sock	*last_snd; /* TCP sock/subflow that sent the last packet*/
+ 	int		snd_burst;
+ 	int		old_wspace;
+ 	u64		recovery_snd_nxt;	/* in recovery mode accept up to this seq;
+@@ -256,12 +267,16 @@ struct mptcp_sock {
+ 	struct sk_buff_head receive_queue;
+ 	int		tx_pending_data;
+ 	struct list_head conn_list;
+-	struct list_head rtx_queue;
++	struct list_head rtx_queue; //VERASV retransmission queueu?
+ 	struct mptcp_data_frag *first_pending;
+ 	struct list_head join_list;
+ 	struct socket	*subflow; /* outgoing connect/listener/!mp_capable */
+ 	struct sock	*first;
+ 	struct mptcp_pm_data	pm;
++
++	u8 			mptcp_sched[MPTCP_SCHED_DATA_SIZE] __aligned(8);
++	const struct mptcp_sched_ops *sched_ops; /* Info of currently used scheduler */
++
+ 	struct {
+ 		u32	space;	/* bytes copied in last measurement window */
+ 		u32	copied; /* bytes copied in this measurement window */
+@@ -406,6 +421,7 @@ DECLARE_PER_CPU(struct mptcp_delegated_action, mptcp_delegated_actions);
+ /* MPTCP subflow context */
+ struct mptcp_subflow_context {
+ 	struct	list_head node;/* conn_list of subflows */
++	unsigned long avg_pacing_rate; /* protected by msk socket lock */
+ 	u64	local_key;
+ 	u64	remote_key;
+ 	u64	idsn;
+@@ -457,6 +473,8 @@ struct mptcp_subflow_context {
+ 	u32	setsockopt_seq;
+ 	u32	stale_rcv_tstamp;
+ 
++	u8	mptcp_sched[MPTCP_SCHED_SIZE] __aligned(8);
++
+ 	struct	sock *tcp_sock;	    /* tcp sk backpointer */
+ 	struct	sock *conn;	    /* parent mptcp_sock */
+ 	const	struct inet_connection_sock_af_ops *icsk_af_ops;
+@@ -483,6 +501,17 @@ mptcp_subflow_tcp_sock(const struct mptcp_subflow_context *subflow)
+ 	return subflow->tcp_sock;
+ }
+ 
++static const inline struct mptcp_sock *mptcp_subflow_mptcp_sock(const struct mptcp_subflow_context *subflow){
++	return mptcp_sk(subflow->conn);
++}
++
++// VERA Rename? move file? Details so not imprtant
++static const inline struct sock *mptcp_meta_sk(const struct sock *sk)
++{
++	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
++    return subflow->conn;
++}
++
+ static inline u64
+ mptcp_subflow_get_map_offset(const struct mptcp_subflow_context *subflow)
+ {
+@@ -563,6 +592,7 @@ static inline void mptcp_subflow_delegated_done(struct mptcp_subflow_context *su
+ 
+ int mptcp_is_enabled(const struct net *net);
+ unsigned int mptcp_get_add_addr_timeout(const struct net *net);
++
+ int mptcp_is_checksum_enabled(const struct net *net);
+ int mptcp_allow_join_id0(const struct net *net);
+ unsigned int mptcp_stale_loss_cnt(const struct net *net);
+@@ -628,6 +658,12 @@ static inline bool mptcp_has_another_subflow(struct sock *ssk)
+ 	return false;
+ }
+ 
++/* Returns end sequence number of the receiver's advertised window */
++static u64 mptcp_wnd_end(const struct mptcp_sock *msk)
++{
++	return READ_ONCE(msk->wnd_end);
++}
++
+ void __init mptcp_proto_init(void);
+ #if IS_ENABLED(CONFIG_MPTCP_IPV6)
+ int __init mptcp_proto_v6_init(void);
+@@ -766,6 +802,41 @@ void mptcp_event(enum mptcp_event_type type, const struct mptcp_sock *msk,
+ void mptcp_event_addr_announced(const struct mptcp_sock *msk, const struct mptcp_addr_info *info);
+ void mptcp_event_addr_removed(const struct mptcp_sock *msk, u8 id);
+ 
++/* MPTCP-scheduler registration/initialization functions */
++struct subflow_send_info {
++	struct sock *ssk;
++	u64 ratio;
++};
++
++struct mptcp_sched_data {
++	bool	reinject;
++	u8	subflows;
++	struct mptcp_subflow_context *contexts[MPTCP_SUBFLOWS_MAX];
++};
++
++struct mptcp_sched_ops {
++	struct list_head list;
++
++	struct sock *		(*get_subflow)(struct mptcp_sock *msk,
++			   struct mptcp_sched_data *data);
++	void			(*init)(struct mptcp_sock *msk);
++	void			(*release)(struct mptcp_subflow_context *subflow);
++
++	char			name[MPTCP_SCHED_NAME_MAX];
++	struct module		*owner;
++};
++
++struct mptcp_sched_ops *mptcp_sched_find(const char *name);
++const char *mptcp_get_scheduler(const struct net *net);
++int mptcp_register_scheduler(struct mptcp_sched_ops *sched);
++void mptcp_unregister_scheduler(struct mptcp_sched_ops *sched);
++void mptcp_cleanup_scheduler(struct mptcp_sock *msk);
++bool mptcp_sk_can_send(struct mptcp_subflow_context *subflow);
++bool mptcp_is_available(struct mptcp_subflow_context *subflow);
++struct sock *get_available_subflow(struct mptcp_sock *msk,
++					   struct mptcp_sched_data *data);
++extern struct mptcp_sched_ops mptcp_sched_rtt;
++
+ static inline bool mptcp_pm_should_add_signal(struct mptcp_sock *msk)
+ {
+ 	return READ_ONCE(msk->pm.addr_signal) &
+@@ -839,6 +910,10 @@ static inline struct mptcp_ext *mptcp_get_ext(const struct sk_buff *skb)
+ 
+ void mptcp_diag_subflow_init(struct tcp_ulp_ops *ops);
+ 
++static inline bool mptcp_check_nospace(struct sock *sk){
++	return test_bit(SOCK_NOSPACE, &sk->sk_socket->flags); // VERASV maybe add check on MPTCP_NOSPACE as well?
++}
++
+ static inline bool __mptcp_check_fallback(const struct mptcp_sock *msk)
+ {
+ 	return test_bit(MPTCP_FALLBACK_DONE, &msk->flags);
+@@ -901,4 +976,4 @@ mptcp_token_join_cookie_init_state(struct mptcp_subflow_request_sock *subflow_re
+ static inline void mptcp_join_cookie_init(void) {}
+ #endif
+ 
+-#endif /* __MPTCP_PROTOCOL_H */
++#endif /* __MPTCP_PROTOCOL_H */
+\ No newline at end of file
+diff --git a/net/mptcp/sched.c b/net/mptcp/sched.c
+new file mode 100644
+index 000000000000..131561c00797
+--- /dev/null
++++ b/net/mptcp/sched.c
+@@ -0,0 +1,147 @@
++/* MPTCP Scheduler module selector. Highly inspired by tcp_cong.c */
++
++#include <linux/bug.h>
++#include <linux/module.h>
++#include <net/mptcp.h>
++#include <net/tcp.h>
++#include <trace/events/tcp.h>
++
++#include "protocol.h"
++
++static DEFINE_SPINLOCK(mptcp_sched_list_lock);
++static LIST_HEAD(mptcp_sched_list);
++
++/* estimate number of segments currently in flight + unsent in
++ * the subflow socket.
++ */
++static int mptcp_subflow_queued(struct sock *sk, u32 max_tso_segs)
++{
++	const struct tcp_sock *tp = tcp_sk(sk);
++	unsigned int queued;
++
++	/* estimate the max number of segments in the write queue
++	 * this is an overestimation, avoiding to iterate over the queue
++	 * to make a better estimation.
++	 * Having only one skb in the queue however might trigger tso deferral,
++	 * delaying the sending of a tso segment in the hope that skb_entail
++	 * will append more data to the skb soon.
++	 * Therefore, in the case only one skb is in the queue, we choose to
++	 * potentially underestimate, risking to schedule one skb too many onto
++	 * the subflow rather than not enough.
++	 */
++	if (sk->sk_write_queue.qlen > 1)
++		queued = sk->sk_write_queue.qlen * max_tso_segs;
++	else
++		queued = sk->sk_write_queue.qlen;
++
++	return queued + tcp_packets_in_flight(tp);
++}
++
++/* subflow socket can send (doesn't mean it is available to send)*/
++bool mptcp_sk_can_send(struct mptcp_subflow_context *subflow){
++	return tcp_passive_fastopen(mptcp_subflow_tcp_sock(subflow)) || mptcp_subflow_active(subflow);
++}
++EXPORT_SYMBOL_GPL(mptcp_sk_can_send);
++
++/* Is the sub-socket sk available to send? */
++bool mptcp_is_available(struct mptcp_subflow_context *subflow) // VERASV this function need review! Writen by me
++{
++	struct sock *sk = mptcp_subflow_tcp_sock(subflow);
++	const struct tcp_sock *tp = tcp_sk(sk);
++	unsigned int mss_now;
++
++	/* Set of states for which we are allowed to send data */
++	if(!mptcp_sk_can_send(subflow))
++		return false;
++
++	/** We do not send if other end is not multipath capable
++	 * or if didn't join a mp_capable connection
++	 */
++	if (!subflow->mp_capable && !subflow->mp_join)
++		return false;
++
++	if (inet_csk(sk)->icsk_ca_state == TCP_CA_Loss) { // VERASV sus? ska vi ha kvar detta?
++		/* If SACK is disabled, and we got a loss, TCP does not exit
++		 * the loss-state until something above high_seq has been
++		 * acked. (see tcp_try_undo_recovery)
++		 *
++		 * high_seq is the snd_nxt at the moment of the RTO. As soon
++		 * as we have an RTO, we won't push data on the subflow.
++		 * Thus, snd_una can never go beyond high_seq.
++		 */
++		if (!tcp_is_reno(tp))
++			return false;
++		else if (tp->snd_una != tp->high_seq)
++			return false;
++	}
++
++	mss_now = tcp_current_mss(sk);
++
++	/** We do not send if the cwnd is full
++	 *  in flight + queued in the socket should not exceed the socket's congestion window
++	 */
++	if (mptcp_subflow_queued(sk, tcp_tso_segs(sk, mss_now)) >= tp->snd_cwnd)
++		return false;
++
++    return true;
++}
++EXPORT_SYMBOL_GPL(mptcp_is_available);
++
++struct mptcp_sched_ops *mptcp_sched_find(const char *name)
++{
++	struct mptcp_sched_ops *e;
++
++	list_for_each_entry_rcu(e, &mptcp_sched_list, list) {
++		if (!strcmp(e->name, name))
++			return e;
++	}
++
++	return NULL;
++}
++
++int mptcp_register_scheduler(struct mptcp_sched_ops *sched)
++{
++	int ret = 0;
++
++	if (!sched->get_subflow)
++		return -EINVAL;
++
++	spin_lock(&mptcp_sched_list_lock);
++	if (mptcp_sched_find(sched->name)) {
++		pr_notice("%s already registered\n", sched->name);
++		ret = -EEXIST;
++	} else {
++		list_add_tail_rcu(&sched->list, &mptcp_sched_list);
++		pr_info("%s registered\n", sched->name);
++	}
++	spin_unlock(&mptcp_sched_list_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mptcp_register_scheduler);
++
++void mptcp_unregister_scheduler(struct mptcp_sched_ops *sched)
++{
++	if (sched == &mptcp_sched_rtt)
++		return;
++		 
++	spin_lock(&mptcp_sched_list_lock);
++	list_del_rcu(&sched->list);
++	spin_unlock(&mptcp_sched_list_lock);
++
++	/* Wait for outstanding readers to complete before the
++	 * module gets removed entirely.
++	 *
++	 * A try_module_get() should fail by now as our module is
++	 * in "going" state since no refs are held anymore and
++	 * module_exit() handler being called.
++	 */
++	synchronize_rcu();
++}
++EXPORT_SYMBOL_GPL(mptcp_unregister_scheduler);
++
++/* Manage refcounts on socket close. */
++void mptcp_cleanup_scheduler(struct mptcp_sock *msk)
++{
++	module_put(msk->sched_ops->owner);
++}
+-- 
+2.48.1.windows.1
+
